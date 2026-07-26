@@ -1,143 +1,185 @@
 #!/usr/bin/env python3
-"""Amlogic Burn Tool v3 — full USB init + multi-strategy."""
-import sys, os, time, struct
-import usb.core
-import usb.util
+"""Amlogic Burn — Native WinUSB (bypass libusb entirely)."""
+import sys, os, time, ctypes
+from ctypes import wintypes, byref, Structure, sizeof, POINTER
 
-VID, PID = 0x1B8E, 0xC003
+# Win32 types
+ULONG = wintypes.ULONG
+HANDLE = wintypes.HANDLE
+LPVOID = wintypes.LPVOID
+BOOL = wintypes.BOOL
+GUID_STRUCT = ctypes.c_ubyte * 16
+
+# WinUSB GUID {3f24e8de-b953-45f5-86d9-2da6744a1521}
+WINUSB_GUID = GUID_STRUCT(
+    0xDE, 0xE8, 0x24, 0x3F, 0x53, 0xB9, 0xF5, 0x45,
+    0x86, 0xD9, 0x2D, 0xA6, 0x74, 0x4A, 0x15, 0x21
+)
+
+# Win32 API
+kernel32 = ctypes.windll.kernel32
+setupapi = ctypes.windll.setupapi
+winusb_dll = ctypes.windll.winusb
+
+# Constants
+GENERIC_READ = 0x80000000
+GENERIC_WRITE = 0x40000000
+FILE_SHARE_WRITE = 2
+OPEN_EXISTING = 3
+FILE_FLAG_OVERLAPPED = 0x40000000
+INVALID_HANDLE_VALUE = HANDLE(-1).value
+DIGCF_PRESENT = 2
+SPDRP_HARDWAREID = 1
+
 TIMEOUT = 10000
-CHUNK = 512 * 1024
-MAX_PKT = 65536
+CHUNK = 1024 * 1024
 
 
-def log(msg):
-    print(f"  {msg}")
+class SP_DEVINFO_DATA(Structure):
+    _fields_ = [
+        ("cbSize", ULONG),
+        ("ClassGuid", ctypes.c_ubyte * 16),
+        ("DevInst", ULONG),
+        ("Reserved", LPVOID),
+    ]
 
 
-def find_and_init():
-    """Find device, gentle init."""
-    log("Scanning for Amlogic device...")
-    for dev in usb.core.find(find_all=True, idVendor=VID, idProduct=PID):
-        try:
-            dev.set_configuration()
-            try:
-                if dev.is_kernel_driver_active(0):
-                    dev.detach_kernel_driver(0)
-            except:
-                pass
-            try:
-                usb.util.claim_interface(dev, 0)
-            except:
-                pass
-            log(f"Found: {dev.manufacturer} {dev.product}")
-            return dev
-        except Exception as e:
-            log(f"Init failed: {e}")
-            continue
-    return None
+def enum_usb_devices():
+    """Find all USB devices with Amlogic VID/PID via SetupAPI."""
+    hdi = setupapi.SetupDiGetClassDevsA(None, "USB", None,
+        DIGCF_PRESENT)
+    if hdi == INVALID_HANDLE_VALUE:
+        return []
+
+    results = []
+    dev_data = SP_DEVINFO_DATA()
+    dev_data.cbSize = sizeof(SP_DEVINFO_DATA)
+
+    idx = 0
+    while setupapi.SetupDiEnumDeviceInfo(hdi, idx, byref(dev_data)):
+        idx += 1
+        buf = ctypes.create_string_buffer(256)
+        if setupapi.SetupDiGetDeviceRegistryPropertyA(
+            hdi, byref(dev_data), SPDRP_HARDWAREID, None, buf, 256, None):
+            hwid = buf.value.decode('utf-8', errors='ignore').lower()
+            if "vid_1b8e" in hwid and "pid_c003" in hwid:
+                # Get device path
+                buf2 = ctypes.create_unicode_buffer(512)
+                if setupapi.SetupDiGetDeviceInstanceIdW(
+                    hdi, byref(dev_data), buf2, 512, None):
+                    # Build WinUSB path
+                    guid_str = "{3f24e8de-b953-45f5-86d9-2da6744a1521}"
+                    path = f"\\\\?\\usb#vid_1b8e&pid_c003#{buf2.value}#{guid_str}"
+                    results.append(path)
+
+    setupapi.SetupDiDestroyDeviceInfoList(hdi)
+    return results
 
 
-def try_write(dev, data, ep=0x02):
-    """Try bulk write, fall back to control if fails."""
-    # Strategy 1: Bulk write (try first 64 bytes)
-    try:
-        n = dev.write(ep, data[:64], timeout=3000)
-        if n > 0:
-            return "bulk"
-    except Exception:
-        pass
+def open_winusb():
+    """Open Amlogic device via WinUSB."""
+    paths = enum_usb_devices()
+    if not paths:
+        print("ERROR: Device not found. Install WinUSB driver via Zadig!")
+        print("  Zadig: Driver → WinUSB (not libusb-win32, not libusbK)")
+        sys.exit(1)
 
-    # Strategy 2: Control transfer 64 bytes
-    try:
-        dev.ctrl_transfer(0x40, 0x03, 0, 0, data[:64], timeout=3000)
-        return "ctrl"
-    except Exception:
-        pass
+    path = paths[0]
+    print(f"  Path: {path}")
+    
+    # Open device
+    h = kernel32.CreateFileW(
+        path,
+        GENERIC_WRITE,
+        FILE_SHARE_WRITE,
+        None,
+        OPEN_EXISTING,
+        FILE_FLAG_OVERLAPPED,
+        None,
+    )
+    if h == INVALID_HANDLE_VALUE:
+        err = kernel32.GetLastError()
+        print(f"ERROR: CreateFile failed ({err})")
+        print("Make sure WinUSB driver is installed (Zadig → WinUSB)")
+        sys.exit(1)
 
-    # Strategy 3: Tiny control, raw vendor
-    try:
-        dev.ctrl_transfer(0x40, 0xFF, 0, 0, data[:64], timeout=3000)
-        return "tiny"
-    except Exception:
-        pass
+    # Initialize WinUSB
+    wh = HANDLE()
+    if not winusb_dll.WinUsb_Initialize(h, byref(wh)):
+        err = kernel32.GetLastError()
+        kernel32.CloseHandle(h)
+        print(f"ERROR: WinUsb_Initialize failed ({err})")
+        sys.exit(1)
 
-    return None
+    print("  WinUSB initialized OK")
+    return h, wh
 
 
-def upload(dev, path, name):
-    """Upload using detected method."""
+def upload(wh, path, name):
+    """Upload file via WinUSB bulk pipe."""
     with open(path, "rb") as f:
         data = f.read()
     total = len(data)
-
-    # Probe with first 64 bytes
-    probe = data[:64]
-    method = try_write(dev, probe)
-    if method is None:
-        log(f"ALL methods failed for {name}")
-        return False
-    log(f"Method: {method}")
-
+    buf = (ctypes.c_ubyte * CHUNK)()
     pos = 0
+
     while pos < total:
         chunk = data[pos:pos + CHUNK]
-        if method == "bulk":
-            try:
-                dev.write(0x02, chunk, timeout=TIMEOUT)
-            except Exception:
-                log(f"Bulk failed at {pos//1024//1024}MB, fallback to ctrl")
-                method = "ctrl"
-                continue
-        elif method in ("ctrl", "tiny"):
-            for i in range(0, len(chunk), 4096):
-                sub = chunk[i:i + 4096]
-                try:
-                    dev.ctrl_transfer(0x40, 0x03, 0, i // 4096, sub, timeout=5000)
-                except Exception:
-                    log(f"Ctrl failed at {pos//1024//1024}MB")
-                    return False
-        pos += len(chunk)
-        if pos % (CHUNK * 5) == 0 or pos >= total:
-            pct = pos * 100 // total
-            log(f"  {name}: {pct}% ({pos//1024//1024}MB / {total//1024//1024}MB)")
+        ctypes.memmove(buf, chunk, len(chunk))
+        written = ULONG()
 
+        if not winusb_dll.WinUsb_WritePipe(wh, 0x02, buf, len(chunk),
+                                            byref(written), None):
+            err = kernel32.GetLastError()
+            print(f"\n  WinUsb_WritePipe failed at {pos//1024//1024}MB: error {err}")
+            return False
+
+        pos += len(chunk)
+        pct = pos * 100 // total
+        if pos % (CHUNK * 5) == 0 or pos >= total:
+            print(f"\r  {name}: {pct}% ({pos//1024//1024}MB / {total//1024//1024}MB)", end="")
+
+    print()
     return True
 
 
 def main():
-    img = sys.argv[1] if len(sys.argv) > 1 else "."
-    ddr = os.path.join(img, "DDR.USB")
-    ubt = os.path.join(img, "UBOOT.USB")
-    boot = os.path.join(img, "boot.PARTITION")
-    sysp = os.path.join(img, "system.PARTITION")
+    if len(sys.argv) < 2:
+        print("Usage: python aml_burn.py <dir>")
+        sys.exit(1)
 
-    for f, n in [(ddr, "DDR"), (ubt, "UBOOT"), (boot, "boot"), (sysp, "system")]:
-        if not os.path.isfile(f):
-            print(f"ERROR: Missing {n} -> {f}")
+    d = sys.argv[1]
+    files = [
+        ("DDR.USB", "DDR", 0),
+        ("UBOOT.USB", "UBOOT", 0),
+        ("boot.PARTITION", "boot", 0),
+        ("system.PARTITION", "system", 0),
+    ]
+
+    for fname, _, _ in files:
+        p = os.path.join(d, fname)
+        if not os.path.isfile(p):
+            print(f"Missing: {fname}")
             sys.exit(1)
 
     print("=" * 50)
-    print(" Amlogic Burn v3 — Auto-detect transfer mode")
+    print(" Amlogic Burn — Native WinUSB")
     print("=" * 50)
 
-    dev = find_and_init()
-    if not dev:
-        print("ERROR: Cannot connect to device")
-        sys.exit(1)
+    h, wh = open_winusb()
 
-    for step, f, name in [
-        (1, ddr, "DDR.USB"),
-        (2, ubt, "UBOOT.USB"),
-        (3, boot, "boot.PARTITION"),
-        (4, sysp, "system.PARTITION"),
-    ]:
-        log(f"[{step}/4] {name} ({os.path.getsize(f)//1024//1024}MB)")
-        if not upload(dev, f, name):
-            print(f"\nFAILED at step {step}")
+    for i, (fname, label, _) in enumerate(files):
+        p = os.path.join(d, fname)
+        mb = os.path.getsize(p) // 1024 // 1024
+        print(f"\n[{i+1}/4] {label} ({mb}MB)")
+        if not upload(wh, p, label):
+            print("FAILED!")
+            kernel32.CloseHandle(h)
             sys.exit(1)
         time.sleep(1)
 
-    print("\nDone! Power cycle.\n")
+    kernel32.CloseHandle(h)
+    print("\nDone! Power cycle the box.\n")
 
 
 if __name__ == "__main__":
