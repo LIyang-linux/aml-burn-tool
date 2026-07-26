@@ -46,8 +46,7 @@ class SP_DEVINFO_DATA(Structure):
 
 def enum_usb_devices():
     """Find all USB devices with Amlogic VID/PID via SetupAPI."""
-    hdi = setupapi.SetupDiGetClassDevsA(None, "USB", None,
-        DIGCF_PRESENT)
+    hdi = setupapi.SetupDiGetClassDevsA(None, None, None, DIGCF_PRESENT)
     if hdi == INVALID_HANDLE_VALUE:
         return []
 
@@ -63,14 +62,36 @@ def enum_usb_devices():
             hdi, byref(dev_data), SPDRP_HARDWAREID, None, buf, 256, None):
             hwid = buf.value.decode('utf-8', errors='ignore').lower()
             if "vid_1b8e" in hwid and "pid_c003" in hwid:
-                # Get device path
-                buf2 = ctypes.create_unicode_buffer(512)
-                if setupapi.SetupDiGetDeviceInstanceIdW(
-                    hdi, byref(dev_data), buf2, 512, None):
-                    # Build WinUSB path
-                    guid_str = "{3f24e8de-b953-45f5-86d9-2da6744a1521}"
-                    path = f"\\\\?\\usb#vid_1b8e&pid_c003#{buf2.value}#{guid_str}"
-                    results.append(path)
+                print(f"  Found: {hwid}")
+                # Get device path via CM_Get_Device_ID
+                devid_buf = ctypes.create_unicode_buffer(256)
+                if not setupapi.SetupDiGetDeviceInstanceIdW(
+                    hdi, byref(dev_data), devid_buf, 256, None):
+                    continue
+                
+                # Try multiple path formats
+                # Format 1: WinUSB GUID
+                for guid in [
+                    "{3f24e8de-b953-45f5-86d9-2da6744a1521}",  # WinUSB
+                    "{dee824ef-729b-4a0e-9c69-b452f5e6f76b}",  # libusbK
+                    "{a5dcbf10-6530-11d2-901f-00c04fb951ed}",  # Generic USB
+                ]:
+                    path1 = f"\\\\?\\usb#vid_1b8e&pid_c003#{devid_buf.value}#{guid}"
+                    h = kernel32.CreateFileW(path1, GENERIC_WRITE, FILE_SHARE_WRITE,
+                        None, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, None)
+                    if h != INVALID_HANDLE_VALUE:
+                        kernel32.CloseHandle(h)
+                        results.append((path1, "WinUSB" if "3f24" in guid else "other"))
+                        break
+                    else:
+                        # Format 2: Without VID/PID prefix
+                        path2 = f"\\\\?\\usb#{devid_buf.value}#{guid}"
+                        h = kernel32.CreateFileW(path2, GENERIC_WRITE, FILE_SHARE_WRITE,
+                            None, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, None)
+                        if h != INVALID_HANDLE_VALUE:
+                            kernel32.CloseHandle(h)
+                            results.append((path2, "WinUSB-short"))
+                            break
 
     setupapi.SetupDiDestroyDeviceInfoList(hdi)
     return results
@@ -78,14 +99,17 @@ def enum_usb_devices():
 
 def open_winusb():
     """Open Amlogic device via WinUSB."""
-    paths = enum_usb_devices()
-    if not paths:
-        print("ERROR: Device not found. Install WinUSB driver via Zadig!")
-        print("  Zadig: Driver → WinUSB (not libusb-win32, not libusbK)")
+    devs = enum_usb_devices()
+    if not devs:
+        print("\nERROR: No Amlogic device found with accessible path.")
+        print("Possible fixes:")
+        print("  1. Zadig → select Amlogic → Driver: WinUSB → Replace")
+        print("  2. Re-enter USB download mode (power cycle + hold reset)")
         sys.exit(1)
 
-    path = paths[0]
+    path, method = devs[0]
     print(f"  Path: {path}")
+    print(f"  Method: {method}")
     
     # Open device
     h = kernel32.CreateFileW(
