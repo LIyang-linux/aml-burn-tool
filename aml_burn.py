@@ -193,7 +193,7 @@ def upload_winusb(wh, path, name, step, total_steps):
 
 
 def upload_pyusb(dev, path, name, step, total_steps):
-    """Upload via pyusb bulk endpoint."""
+    """Upload via pyusb — try multiple strategies."""
     import usb.core
     with open(path, "rb") as f:
         data = f.read()
@@ -201,19 +201,45 @@ def upload_pyusb(dev, path, name, step, total_steps):
     pos = 0
     start = time.time()
 
-    while pos < size:
-        chunk = data[pos:pos + CHUNK]
+    # Try to find working chunk size
+    chunk_size = CHUNK
+    method_name = "bulk-1M"
+    
+    # Probe: test bulk write
+    test_size = min(64, size)
+    try:
+        n = dev.write(BULK_OUT, data[:test_size], timeout=5000)
+        log(f"Bulk write OK ({n} bytes)", "OK")
+    except usb.core.USBError as e:
+        # Try control transfer
+        log(f"Bulk failed: {str(e)[:60]}", "WARN")
         try:
-            n = dev.write(BULK_OUT, chunk, timeout=TIMEOUT)
+            dev.ctrl_transfer(0x40, 0x03, 0, 0, data[:64], timeout=5000)
+            chunk_size = 4096
+            method_name = "ctrl-4K"
+            log("Control transfer works! Switching to 4KB chunks.", "OK")
         except usb.core.USBError:
-            log(f"Bulk failed at {pos//1024//1024}MB", "FAIL")
+            log("All transfer methods exhausted.", "FAIL")
+            return False
+
+    while pos < size:
+        chunk = data[pos:pos + chunk_size]
+        try:
+            if method_name.startswith("bulk"):
+                dev.write(BULK_OUT, chunk, timeout=TIMEOUT)
+            else:
+                for i in range(0, len(chunk), 4096):
+                    sub = chunk[i:i + 4096]
+                    dev.ctrl_transfer(0x40, 0x03, 0, i // 4096, sub, timeout=TIMEOUT)
+        except Exception as e:
+            log(f"Transfer failed at {pos//1024//1024}MB: {str(e)[:60]}", "FAIL")
             return False
         pos += len(chunk)
-        if pos % (CHUNK * 3) == 0 or pos >= size:
+        if pos % (chunk_size * 5) == 0 or pos >= size:
             elapsed = max(0.01, time.time() - start)
             speed = (pos / 1024 / 1024) / elapsed
             pct = pos * 100 // size
-            print(f"\r  [{step}/{total_steps}] {name}: {pct}%  {speed:.1f}MB/s", end="", flush=True)
+            print(f"\r  [{step}/{total_steps}] {name}: {pct}%  {speed:.1f}MB/s ({method_name})", end="", flush=True)
 
     print()
     return True
