@@ -15,16 +15,11 @@ def log(msg):
 
 
 def find_and_init():
-    """Find device and fully initialize USB."""
+    """Find device, gentle init."""
     log("Scanning for Amlogic device...")
     for dev in usb.core.find(find_all=True, idVendor=VID, idProduct=PID):
         try:
-            # Full reset sequence
-            dev.reset()
-            time.sleep(0.5)
-            # Set configuration
             dev.set_configuration()
-            # Claim interface 0
             try:
                 if dev.is_kernel_driver_active(0):
                     dev.detach_kernel_driver(0)
@@ -37,35 +32,31 @@ def find_and_init():
             log(f"Found: {dev.manufacturer} {dev.product}")
             return dev
         except Exception as e:
-            log(f"Init attempt failed: {e}")
+            log(f"Init failed: {e}")
             continue
     return None
 
 
 def try_write(dev, data, ep=0x02):
     """Try bulk write, fall back to control if fails."""
-    # Strategy 1: Bulk write
+    # Strategy 1: Bulk write (try first 64 bytes)
     try:
-        n = dev.write(ep, data[:4096], timeout=3000)
+        n = dev.write(ep, data[:64], timeout=3000)
         if n > 0:
             return "bulk"
     except Exception:
         pass
 
-    # Strategy 2: Control transfer in 4KB chunks
+    # Strategy 2: Control transfer 64 bytes
     try:
-        for i in range(0, min(65536, len(data)), 4096):
-            chunk = data[i:i + 4096]
-            n = dev.ctrl_transfer(0x40, 0x03, 0, i // 4096, chunk, timeout=2000)
+        dev.ctrl_transfer(0x40, 0x03, 0, 0, data[:64], timeout=3000)
         return "ctrl"
     except Exception:
         pass
 
-    # Strategy 3: Tiny control transfer (64 bytes)
+    # Strategy 3: Tiny control, raw vendor
     try:
-        for i in range(0, min(1024, len(data)), 64):
-            chunk = data[i:i + 64]
-            dev.ctrl_transfer(0x40, 0xFF, 0, i, chunk, timeout=1000)
+        dev.ctrl_transfer(0x40, 0xFF, 0, 0, data[:64], timeout=3000)
         return "tiny"
     except Exception:
         pass
@@ -74,31 +65,42 @@ def try_write(dev, data, ep=0x02):
 
 
 def upload(dev, path, name):
-    """Upload file to device using best available strategy."""
+    """Upload using detected method."""
     with open(path, "rb") as f:
         data = f.read()
     total = len(data)
 
-    # Probe best transfer method with first 64KB
-    probe = data[:65536]
+    # Probe with first 64 bytes
+    probe = data[:64]
     method = try_write(dev, probe)
     if method is None:
-        log(f"ALL transfer methods failed for {name}")
+        log(f"ALL methods failed for {name}")
         return False
     log(f"Method: {method}")
 
-    pos = 65536  # Already sent probe
+    pos = 0
     while pos < total:
         chunk = data[pos:pos + CHUNK]
-        if not try_write(dev, chunk):
-            log(f"Transfer failed at {pos//1024//1024}MB")
-            return False
+        if method == "bulk":
+            try:
+                dev.write(0x02, chunk, timeout=TIMEOUT)
+            except Exception:
+                log(f"Bulk failed at {pos//1024//1024}MB, fallback to ctrl")
+                method = "ctrl"
+                continue
+        elif method in ("ctrl", "tiny"):
+            for i in range(0, len(chunk), 4096):
+                sub = chunk[i:i + 4096]
+                try:
+                    dev.ctrl_transfer(0x40, 0x03, 0, i // 4096, sub, timeout=5000)
+                except Exception:
+                    log(f"Ctrl failed at {pos//1024//1024}MB")
+                    return False
         pos += len(chunk)
-        if pos % (CHUNK * 5) == 0:
+        if pos % (CHUNK * 5) == 0 or pos >= total:
             pct = pos * 100 // total
             log(f"  {name}: {pct}% ({pos//1024//1024}MB / {total//1024//1024}MB)")
 
-    log(f"{name}: OK")
     return True
 
 
