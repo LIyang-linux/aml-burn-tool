@@ -220,16 +220,22 @@ def upload_pyusb(dev, path, name, step, total_steps):
     while pos < size:
         piece = data[pos:pos + 64]
         try:
-            dev.ctrl_transfer(0x40, 0x03, pos & 0xFFFF, (pos >> 16) & 0xFFFF,
+            dev.ctrl_transfer(0x40, 0x03, 0, 0,  # always (0,0), Boot ROM auto-increment
                              piece, timeout=TIMEOUT)
             errors = 0
             pos += 64
         except Exception as e:
             errors += 1
-            if errors > 10:
+            if errors > 3:
                 log(f"Fatal at packet {pos//64}/{total_packets}: {e}", "FAIL")
                 return False
-            time.sleep(0.05)
+            # Device may have reset — re-claim
+            try:
+                dev.set_configuration()
+                usb.util.claim_interface(dev, 0)
+            except:
+                pass
+            time.sleep(0.1)
 
         if pos % (64 * 1000) == 0 or pos >= size:
             elapsed = max(0.01, time.time() - start)
