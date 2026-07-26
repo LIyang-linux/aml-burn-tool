@@ -193,93 +193,55 @@ def upload_winusb(wh, path, name, step, total_steps):
 
 
 def upload_pyusb(dev, path, name, step, total_steps):
-    """Upload via pyusb — verbose debug mode."""
+    """Upload via pyusb — 64-byte control transfer mode."""
     import usb.core
     with open(path, "rb") as f:
         data = f.read()
     size = len(data)
     start = time.time()
-    log(f"{name}: {size} bytes, will try multiple methods")
+    mb = size // 1024 // 1024
+    log(f"{name}: {size} bytes ({mb}MB), testing USB path...")
 
-    # === Test 1: Bulk write 1 byte ===
-    log("Test 1: Bulk OUT 1 byte...")
+    # === Probe: try 64-byte control transfer ===
     try:
-        n = dev.write(0x02, data[:1], timeout=3000)
-        log(f"→ OK! wrote {n} byte", "OK")
-        method = "bulk"
-        chunk = CHUNK
+        dev.ctrl_transfer(0x40, 0x03, 0, 0, data[:64], timeout=3000)
+        log("Control transfer probe OK!", "OK")
     except Exception as e:
-        log(f"→ FAIL: {e}", "FAIL")
+        log(f"Control transfer probe FAILED: {e}", "FAIL")
+        log("xHCI is fundamentally incompatible with this Boot ROM", "FAIL")
+        return False
 
-        # === Test 2: Bulk write 64 bytes ===
-        log("Test 2: Bulk OUT 64 bytes...")
-        try:
-            n = dev.write(0x02, data[:64], timeout=3000)
-            log(f"→ OK! wrote {n} bytes", "OK")
-            method = "bulk"
-            chunk = CHUNK
-        except Exception as e:
-            log(f"→ FAIL: {e}", "FAIL")
-
-            # === Test 3: Control OUT 64 bytes, bRequest=0x03 ===
-            log("Test 3: Control OUT bRequest=0x03, 64 bytes...")
-            try:
-                dev.ctrl_transfer(0x40, 0x03, 0, 0, data[:64], timeout=3000)
-                log("→ OK!", "OK")
-                method = "ctrl-4K"
-                chunk = 4096
-            except Exception as e:
-                log(f"→ FAIL: {e}", "FAIL")
-
-                # === Test 4: Control OUT, alternate bRequest ===
-                log("Test 4: Control OUT bRequest=0xA0, 64 bytes...")
-                try:
-                    dev.ctrl_transfer(0x40, 0xA0, 0, 0, data[:64], timeout=3000)
-                    log("→ OK!", "OK")
-                    method = "ctrl-4K"
-                    chunk = 4096
-                except Exception as e:
-                    log(f"→ FAIL: {e}", "FAIL")
-
-                    # === Test 5: Control OUT, bRequest=0xFF ===
-                    log("Test 5: Control OUT bRequest=0xFF, 64 bytes...")
-                    try:
-                        dev.ctrl_transfer(0x40, 0xFF, 0, 0, data[:64], timeout=3000)
-                        log("→ OK!", "OK")
-                        method = "ctrl-4K"
-                        chunk = 4096
-                    except Exception as e:
-                        log(f"→ FAIL: {e}", "FAIL")
-                        log("ALL 5 strategies exhausted. xHCI is incompatible.", "FAIL")
-                        return False
-
-    # === Upload with working method ===
-    log(f"Uploading via {method}, chunk={chunk}...")
+    # === Upload in 64-byte chunks ===
+    log(f"Uploading {mb}MB via 64-byte control transfers...")
     pos = 0
     errors = 0
+    total_packets = size // 64
+
     while pos < size:
-        piece = data[pos:pos + chunk]
+        piece = data[pos:pos + 64]
         try:
-            if method == "bulk":
-                dev.write(0x02, piece, timeout=TIMEOUT)
-            else:
-                for i in range(0, len(piece), 4096):
-                    sub = piece[i:i + 4096]
-                    dev.ctrl_transfer(0x40, 0x03, 0, i // 4096, sub, timeout=5000)
+            dev.ctrl_transfer(0x40, 0x03, pos & 0xFFFF, (pos >> 16) & 0xFFFF,
+                             piece, timeout=TIMEOUT)
             errors = 0
-            pos += len(piece)
+            pos += 64
         except Exception as e:
             errors += 1
-            log(f"Error at {pos//1024//1024}MB (error #{errors}): {str(e)[:80]}", "WARN")
-            if errors > 5:
+            if errors > 10:
+                log(f"Fatal at packet {pos//64}/{total_packets}: {e}", "FAIL")
                 return False
-            time.sleep(0.1)
+            time.sleep(0.05)
 
-        if pos % (chunk * 20) == 0 or pos >= size:
+        if pos % (64 * 1000) == 0 or pos >= size:
             elapsed = max(0.01, time.time() - start)
-            speed = (pos / 1024 / 1024) / elapsed
+            kbps = (pos / 1024) / elapsed
             pct = pos * 100 // size
-            print(f"\r  [{step}/{total_steps}] {name}: {pct}%  {speed:.1f}MB/s  ", end="", flush=True)
+            eta = (size - pos) / 64 * (elapsed / max(1, pos)) if pos > 0 else 0
+            print(f"\r  [{step}/{total_steps}] {name}: {pct}%  {kbps:.0f}KB/s  ETA: {eta:.0f}s", end="", flush=True)
+
+    print()
+    elapsed = time.time() - start
+    log(f"Uploaded {mb}MB in {elapsed:.0f}s ({mb/elapsed*1024:.0f}KB/s)", "OK")
+    return True
 
     print()
     log(f"Uploaded in {time.time()-start:.0f}s", "OK")
