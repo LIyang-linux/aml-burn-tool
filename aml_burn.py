@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Amlogic USB Burn — DDR + Run + Reconnect test."""
 import sys, os, time, struct
+os.environ["PYUSB_BACKEND"] = "libusb0"  # Force libusb0 (compatible with libusb-win32 driver)
 import usb.core, usb.util
 
 VID, PID = 0x1B8E, 0xC003
