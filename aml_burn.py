@@ -1,286 +1,199 @@
 #!/usr/bin/env python3
-"""Amlogic Burn Tool — MAXIMUM VERBOSE DEBUG. Every byte logged."""
-import sys, os, time, traceback
+"""
+Amlogic USB Burn Tool — CORRECT Protocol Edition
+Based on pyamlboot reverse engineering.
+Pure control transfer — no bulk (xHCI compatible).
+"""
+import sys, os, time
 import usb.core, usb.util
 
 VID, PID = 0x1B8E, 0xC003
-LOG_FILE = "aml_burn.log"
+
+# Correct Amlogic Boot ROM request codes (from pyamlboot)
+REQ_WRITE_MEM     = 0x01   # Write small memory (up to 64 bytes, control transfer)
+REQ_READ_MEM      = 0x02   # Read small memory
+REQ_RUN_IN_ADDR   = 0x05   # Execute code at address
+REQ_IDENTIFY_HOST = 0x20   # Identify / get chip ID
+REQ_PASSWORD      = 0x35   # Unlock (may not be needed)
+
+BLOCK_SIZE = 64  # Maximum per control transfer
 
 
 def log(msg, level="INFO"):
-    line = f"[{time.strftime('%H:%M:%S')}] [{level}] {msg}"
-    print(line, flush=True)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+    icon = {"INFO": "  ", "OK": "  ✅", "FAIL": "  ❌", "STEP": "  🔧"}
+    print(f"{icon.get(level, '  ')}{msg}", flush=True)
 
 
-def usb_error_str(e):
-    return f"{type(e).__name__}: {e}"
+def find_device():
+    devs = list(usb.core.find(find_all=True, idVendor=VID, idProduct=PID))
+    if not devs:
+        return None
+    d = devs[0]
+    try:
+        d.set_configuration()
+        usb.util.claim_interface(d, 0)
+    except:
+        pass
+    return d
+
+
+def write_simple(dev, address, data):
+    """Write up to 64 bytes to memory via control transfer.
+    REQ_WRITE_MEM: wValue=addr_hi, wIndex=addr_lo
+    """
+    if len(data) > BLOCK_SIZE:
+        raise ValueError(f"Max {BLOCK_SIZE} bytes")
+    dev.ctrl_transfer(
+        bmRequestType=0x40,           # Host-to-Device, Vendor, Device
+        bRequest=REQ_WRITE_MEM,       # 0x01
+        wValue=(address >> 16) & 0xFFFF,
+        wIndex=address & 0xFFFF,
+        data_or_wLength=data,
+        timeout=5000
+    )
+
+
+def write_memory(dev, address, data):
+    """Write arbitrary data to memory in 64-byte chunks."""
+    total = len(data)
+    pos = 0
+    errors = 0
+    start = time.time()
+    label = f"0x{address:08x}"
+
+    while pos < total:
+        chunk = data[pos:pos + BLOCK_SIZE]
+        addr = address + pos
+        try:
+            write_simple(dev, addr, chunk)
+            errors = 0
+            pos += len(chunk)
+        except Exception as e:
+            errors += 1
+            if errors > 10:
+                log(f"Write failed at +{pos//1024}KB: {e}", "FAIL")
+                return False
+            time.sleep(0.05)
+
+        if pos % (BLOCK_SIZE * 200) == 0 or pos >= total:
+            elapsed = max(0.01, time.time() - start)
+            kbps = (pos / 1024) / elapsed
+            pct = pos * 100 // total
+            print(f"\r  {label}: {pct}% {kbps:.0f}KB/s", end="", flush=True)
+
+    elapsed = time.time() - start
+    print(f"\r  {label}: 100% ({total//1024}KB, {elapsed:.0f}s, {total/1024/elapsed:.0f}KB/s)")
+    return True
+
+
+def identify(dev):
+    """Get chip identification."""
+    try:
+        data = dev.ctrl_transfer(0xC0, REQ_IDENTIFY_HOST, 0, 0, 16, timeout=3000)
+        log(f"Chip ID response: {' '.join(f'{b:02x}' for b in data)}")
+        return bytearray(data)
+    except Exception as e:
+        log(f"Identify failed: {e}", "FAIL")
+        # Try alternate identify
+        try:
+            data = dev.ctrl_transfer(0xC0, 0x03, 0, 0, 16, timeout=3000)
+            log(f"Alt identify: {' '.join(f'{b:02x}' for b in data)}")
+            return bytearray(data)
+        except:
+            return None
+
+
+def run(dev, address):
+    """Execute code at address."""
+    log(f"Running at 0x{address:08x}...")
+    try:
+        dev.ctrl_transfer(0x40, REQ_RUN_IN_ADDR, (address >> 16) & 0xFFFF,
+                         address & 0xFFFF, timeout=3000)
+        log(f"Run command sent", "OK")
+        time.sleep(2)
+        return True
+    except Exception as e:
+        log(f"Run failed: {e}", "FAIL")
+        return False
 
 
 def main():
+    print("=" * 60)
+    print("  Amlogic Burn Tool — Correct Protocol Edition")
+    print("=" * 60)
+
     img = sys.argv[1] if len(sys.argv) > 1 else "."
-    log("=" * 60)
-    log("Amlogic Burn Tool — MAXIMUM VERBOSE DEBUG")
-    log(f"Image dir: {img}")
-    log(f"Log file: {LOG_FILE}")
-    log("=" * 60)
-
-    # ======================== PHASE 0: Device ========================
-    log("\n>>> PHASE 0: Device Discovery")
-    devs = list(usb.core.find(find_all=True, idVendor=VID, idProduct=PID))
-    log(f"Devices found: {len(devs)}")
-    if not devs:
-        log("FATAL: No device", "ERROR")
-        sys.exit(1)
-
-    dev = devs[0]
-    log(f"Device: {dev}")
-    log(f"  bus={dev.bus} addr={dev.address} port={getattr(dev,'port_number','?')}")
-    log(f"  speed={dev.speed} (2=HS 480Mbps, 3=SS 5Gbps)")
-    log(f"  manufacturer={dev.manufacturer} product={dev.product}")
-    log(f"  configurations={dev.bNumConfigurations}")
-
-    # USB Descriptor dump
-    try:
-        raw = dev.ctrl_transfer(0x80, 0x06, 0x0100, 0x0000, 18, timeout=1000)
-        log(f"  DeviceDesc: {' '.join(f'{b:02x}' for b in raw)}")
-    except Exception as e:
-        log(f"  DeviceDesc read failed: {usb_error_str(e)}", "WARN")
-
-    # ======================== PHASE 1: USB Init ========================
-    log("\n>>> PHASE 1: USB Initialization")
-    try:
-        dev.set_configuration()
-        log("set_configuration: OK")
-    except Exception as e:
-        log(f"set_configuration: {usb_error_str(e)}", "WARN")
-        try:
-            dev.reset()
-            time.sleep(1)
-            dev.set_configuration()
-            log("reset + set_configuration: OK")
-        except Exception as e2:
-            log(f"reset failed: {usb_error_str(e2)}", "ERROR")
-
-    try:
-        usb.util.claim_interface(dev, 0)
-        log("claim_interface(0): OK")
-    except Exception as e:
-        log(f"claim_interface(0): {usb_error_str(e)}", "WARN")
-
-    # Active config info
-    try:
-        cfg = dev.get_active_configuration()
-        for intf in cfg:
-            log(f"  Interface {intf.bInterfaceNumber}:")
-            for ep in intf:
-                log(f"    EP {ep.bEndpointAddress:#04x} type={ep.bmAttributes} max={ep.wMaxPacketSize}")
-    except Exception as e:
-        log(f"Active config read failed: {usb_error_str(e)}", "WARN")
-
-    # ======================== PHASE 2: USB Probe ========================
-    log("\n>>> PHASE 2: USB Transfer Probe")
-
-    # Load DDR data
     ddr_path = os.path.join(img, "DDR.USB")
-    with open(ddr_path, "rb") as f:
-        ddr = f.read()
-    log(f"DDR.USB loaded: {len(ddr)} bytes")
+    ubt_path = os.path.join(img, "UBOOT.USB")
+    boot_path = os.path.join(img, "boot.PARTITION")
+    sys_path = os.path.join(img, "system.PARTITION")
 
-    # Probe results tracker
-    results = {}
-
-    # Test 1: Bulk OUT 1 byte
-    log("\n--- Test 1: Bulk OUT, 1 byte ---")
-    try:
-        t = time.time()
-        n = dev.write(0x02, ddr[:1], timeout=3000)
-        dt = time.time() - t
-        log(f"  wrote {n} byte in {dt*1000:.0f}ms")
-        results['bulk_1'] = True
-    except Exception as e:
-        log(f"  FAIL: {usb_error_str(e)}")
-        results['bulk_1'] = False
-
-    # Test 2: Bulk OUT 64 bytes
-    log("\n--- Test 2: Bulk OUT, 64 bytes ---")
-    try:
-        t = time.time()
-        n = dev.write(0x02, ddr[:64], timeout=3000)
-        dt = time.time() - t
-        log(f"  wrote {n} bytes in {dt*1000:.0f}ms")
-        results['bulk_64'] = True
-    except Exception as e:
-        log(f"  FAIL: {usb_error_str(e)}")
-        results['bulk_64'] = False
-
-    # Test 3: Bulk OUT 512 bytes
-    log("\n--- Test 3: Bulk OUT, 512 bytes ---")
-    try:
-        t = time.time()
-        n = dev.write(0x02, ddr[:512], timeout=5000)
-        dt = time.time() - t
-        log(f"  wrote {n} bytes in {dt*1000:.0f}ms")
-        results['bulk_512'] = True
-    except Exception as e:
-        log(f"  FAIL: {usb_error_str(e)}")
-        results['bulk_512'] = False
-
-    # Test 4: Bulk OUT 4096 bytes
-    log("\n--- Test 4: Bulk OUT, 4096 bytes ---")
-    try:
-        t = time.time()
-        n = dev.write(0x02, ddr[:4096], timeout=10000)
-        dt = time.time() - t
-        log(f"  wrote {n} bytes in {dt*1000:.0f}ms")
-        results['bulk_4K'] = True
-    except Exception as e:
-        log(f"  FAIL: {usb_error_str(e)}")
-        results['bulk_4K'] = False
-
-    # Test 5: Control OUT bRequest=0x01 (identify)
-    log("\n--- Test 5: Control OUT bRequest=0x01, 8 bytes ---")
-    try:
-        t = time.time()
-        dev.ctrl_transfer(0x40, 0x01, 0, 0, ddr[:8], timeout=3000)
-        dt = time.time() - t
-        log(f"  OK in {dt*1000:.0f}ms")
-        results['ctrl_01'] = True
-    except Exception as e:
-        log(f"  FAIL: {usb_error_str(e)}")
-        results['ctrl_01'] = False
-
-    # Test 6: Control OUT bRequest=0x03 (write memory)
-    log("\n--- Test 6: Control OUT bRequest=0x03, 64 bytes ---")
-    try:
-        t = time.time()
-        dev.ctrl_transfer(0x40, 0x03, 0, 0, ddr[:64], timeout=3000)
-        dt = time.time() - t
-        log(f"  OK in {dt*1000:.0f}ms")
-        results['ctrl_03'] = True
-    except Exception as e:
-        log(f"  FAIL: {usb_error_str(e)}")
-        results['ctrl_03'] = False
-
-    # Test 7: Control OUT bRequest=0x03, 512 bytes
-    log("\n--- Test 7: Control OUT bRequest=0x03, 512 bytes ---")
-    try:
-        t = time.time()
-        dev.ctrl_transfer(0x40, 0x03, 0, 0, ddr[:512], timeout=5000)
-        dt = time.time() - t
-        log(f"  OK in {dt*1000:.0f}ms")
-        results['ctrl_03_512'] = True
-    except Exception as e:
-        log(f"  FAIL: {usb_error_str(e)}")
-        results['ctrl_03_512'] = False
-
-    # Test 8: Control OUT bRequest=0x03, 4096 bytes
-    log("\n--- Test 8: Control OUT bRequest=0x03, 4096 bytes ---")
-    try:
-        t = time.time()
-        dev.ctrl_transfer(0x40, 0x03, 0, 0, ddr[:4096], timeout=10000)
-        dt = time.time() - t
-        log(f"  OK in {dt*1000:.0f}ms")
-        results['ctrl_03_4K'] = True
-    except Exception as e:
-        log(f"  FAIL: {usb_error_str(e)}")
-        results['ctrl_03_4K'] = False
-
-    # Test 9: Control OUT bRequest=0x03 with address in wValue
-    log("\n--- Test 9: Control OUT bRequest=0x03, wValue=0x1234, 64 bytes ---")
-    try:
-        t = time.time()
-        dev.ctrl_transfer(0x40, 0x03, 0x1234, 0, ddr[:64], timeout=3000)
-        dt = time.time() - t
-        log(f"  OK in {dt*1000:.0f}ms")
-        results['ctrl_03_addr'] = True
-    except Exception as e:
-        log(f"  FAIL: {usb_error_str(e)}")
-        results['ctrl_03_addr'] = False
-
-    # Test 10: Control OUT bRequest=0x03, 65536 bytes (max)
-    log("\n--- Test 10: Control OUT bRequest=0x03, 65536 bytes ---")
-    try:
-        t = time.time()
-        dev.ctrl_transfer(0x40, 0x03, 0, 0, ddr[:65536], timeout=15000)
-        dt = time.time() - t
-        log(f"  OK in {dt*1000:.0f}ms")
-        results['ctrl_03_max'] = True
-    except Exception as e:
-        log(f"  FAIL: {usb_error_str(e)}")
-        results['ctrl_03_max'] = False
-
-    # ======================== PHASE 3: Results ========================
-    log("\n" + "=" * 60)
-    log("PROBE RESULTS SUMMARY")
-    log("=" * 60)
-    for k, v in results.items():
-        log(f"  {k}: {'✅ PASS' if v else '❌ FAIL'}")
-    log("")
-
-    # Determine best method
-    if results.get('ctrl_03_max'):
-        log("Best: Control OUT bRequest=0x03, 64KB chunks")
-        method = ('ctrl', 0x03, 65536)
-    elif results.get('ctrl_03_4K'):
-        log("Best: Control OUT bRequest=0x03, 4KB chunks")
-        method = ('ctrl', 0x03, 4096)
-    elif results.get('ctrl_03_512'):
-        log("Best: Control OUT bRequest=0x03, 512B chunks")
-        method = ('ctrl', 0x03, 512)
-    elif results.get('ctrl_03'):
-        log("Best: Control OUT bRequest=0x03, 64B chunks")
-        method = ('ctrl', 0x03, 64)
-    elif results.get('bulk_4K'):
-        log("Best: Bulk OUT, 4KB chunks")
-        method = ('bulk', 0, 4096)
-    elif results.get('bulk_512'):
-        log("Best: Bulk OUT, 512B chunks")
-        method = ('bulk', 0, 512)
-    elif results.get('bulk_64'):
-        log("Best: Bulk OUT, 64B chunks")
-        method = ('bulk', 0, 64)
-    else:
-        log("NO WORKING TRANSFER METHOD FOUND!", "ERROR")
-        log("This xHCI controller cannot communicate with Amlogic Boot ROM.", "ERROR")
-        log("Hardware workaround required: USB 2.0 hub or different computer.", "ERROR")
-        sys.exit(1)
-
-    # ======================== PHASE 4: Upload ========================
-    log(f"\n>>> PHASE 4: Upload DDR.USB via {method}")
-
-    dtype, breq, csz = method
-    pos = 0
-    start = time.time()
-    total = len(ddr)
-    packets = (total + csz - 1) // csz
-
-    while pos < total:
-        chunk = ddr[pos:pos + csz]
-        pkt = pos // csz
-        try:
-            if dtype == 'ctrl':
-                dev.ctrl_transfer(0x40, breq, 0, 0, chunk, timeout=15000)
-            else:
-                dev.write(0x02, chunk, timeout=15000)
-            pos += len(chunk)
-        except Exception as e:
-            log(f"  Packet {pkt}/{packets} FAIL: {usb_error_str(e)}", "ERROR")
-            log(f"  Transfer stopped at {pos//1024}KB / {total//1024}KB", "ERROR")
+    for f, n in [(ddr_path, "DDR"), (ubt_path, "UBOOT"), 
+                 (boot_path, "boot"), (sys_path, "system")]:
+        if not os.path.isfile(f):
+            print(f"Missing: {n}")
             sys.exit(1)
 
-        if pkt % max(1, packets // 20) == 0:
-            pct = pos * 100 // total
-            elapsed = time.time() - start
-            kbps = (pos / 1024) / elapsed if elapsed > 0 else 0
-            log(f"  Packet {pkt}/{packets}: {pct}%  {kbps:.0f}KB/s")
+    # Find device
+    log("Finding device...", "STEP")
+    dev = find_device()
+    if not dev:
+        log("Device not found!", "FAIL")
+        sys.exit(1)
+    log(f"Device: {dev.manufacturer} {dev.product}", "OK")
 
-    log(f"DDR.USB uploaded in {time.time()-start:.0f}s")
+    # Identify
+    log("\nIdentify chip...", "STEP")
+    chip = identify(dev)
 
-    # ======================== DONE ========================
+    # Determine GXL addresses
+    # GXL (S905L): DDR at 0xd9000000, BL2 params at 0xd900c000
+    DDR_LOAD = 0xd9000000
+    BL2_PARAMS = 0xd900c000
+    UBOOT_LOAD = 0x200c000   # GXL U-Boot load address
+
+    # Load DDR
+    with open(ddr_path, "rb") as f:
+        ddr_data = f.read()
+    with open(ubt_path, "rb") as f:
+        ubt_data = f.read()
+    with open(boot_path, "rb") as f:
+        boot_data = f.read()
+    with open(sys_path, "rb") as f:
+        sys_data = f.read()
+
+    log(f"\nFiles: DDR={len(ddr_data)} UBOOT={len(ubt_data)} boot={len(boot_data)//1024//1024}MB system={len(sys_data)//1024//1024}MB")
+
+    # === Step 1: Upload to DDR ===
+    log(f"\nStep 1: Upload DDR to 0x{DDR_LOAD:08x}", "STEP")
+    if not write_memory(dev, DDR_LOAD, ddr_data):
+        log("DDR upload failed!", "FAIL")
+        sys.exit(1)
+    log("DDR uploaded", "OK")
+
+    time.sleep(1)
+
+    # === Step 2: Run DDR ===
+    log(f"\nStep 2: Run DDR at 0x{DDR_LOAD:08x}", "STEP")
+    run(dev, DDR_LOAD)
+    log("DDR init running...", "OK")
+
+    # === Step 3: Upload UBOOT ===
+    log(f"\nStep 3: Upload UBOOT to 0x{UBOOT_LOAD:08x}", "STEP")
+    if not write_memory(dev, UBOOT_LOAD, ubt_data):
+        log("UBOOT upload failed!", "FAIL")
+        sys.exit(1)
+    log("UBOOT uploaded", "OK")
+
+    time.sleep(1)
+
+    # === Step 4: Run UBOOT ===
+    log(f"\nStep 4: Run UBOOT at 0x{UBOOT_LOAD:08x}", "STEP")
+    run(dev, UBOOT_LOAD)
+
     log("\n" + "=" * 60)
-    log("ALL PHASES COMPLETE!")
+    log("ALL DONE! eMMC burning via USB not yet implemented.", "OK")
+    log("(need to reverse U-Boot USB gadget protocol)", "INFO")
     log("=" * 60)
 
 
