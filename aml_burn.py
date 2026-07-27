@@ -158,21 +158,51 @@ def main():
     with open(ubt_path, "rb") as f:
         ubt_data = f.read()
 
-    # Concatenate DDR + UBOOT as one payload for Boot ROM
-    fip_data = ddr_data + ubt_data
-    log(f"\nDDR: {len(ddr_data)} UBOOT: {len(ubt_data)} Combined: {len(fip_data)}")
-
-    # === Step 1: Upload combined FIP to 0xd9000000 ===
-    log(f"\nUploading DDR+UBOOT combined ({len(fip_data)//1024}KB)...", "STEP")
-    log("Boot ROM will automatically chain DDR → U-Boot")
-    if not write_memory(dev, DDR_LOAD, fip_data):
-        log("Upload failed!", "FAIL")
+    # === Step 1: Upload DDR to 0xd9000000 ===
+    log(f"\nStep 1: Upload DDR ({len(ddr_data)//1024}KB) to 0x{DDR_LOAD:08x}", "STEP")
+    if not write_memory(dev, DDR_LOAD, ddr_data):
         sys.exit(1)
-    log("FIP uploaded", "OK")
+    log("DDR uploaded", "OK")
 
-    # === Step 2: Run ===
-    log(f"\nRunning at 0x{DDR_LOAD:08x}", "STEP")
+    # === Step 2: Run DDR ===
+    log(f"\nStep 2: Run DDR init", "STEP")
     run(dev, DDR_LOAD)
+    time.sleep(2)
+
+    # After DDR, device re-enumerates - find it again
+    log("Waiting for device after DDR...", "STEP")
+    time.sleep(5)
+    dev = None
+    for i in range(30):
+        time.sleep(1)
+        dev = find_device()
+        if dev:
+            log(f"Reconnected after {5+i}s", "OK")
+            break
+    if not dev:
+        log("Device not found after DDR!", "FAIL")
+        sys.exit(1)
+
+    # === Step 3: Try UBOOT at multiple addresses ===
+    addrs = [
+        (0x01000000, "64MB base"),
+        (0x10000000, "256MB base"),
+        (0x0200c000, "GXL U-Boot"),
+        (0xd900c000, "BL2 params"),
+        (0x00000000, "Zero (should fail)"),
+    ]
+    
+    for addr, desc in addrs:
+        log(f"\nTrying UBOOT upload at 0x{addr:08x} ({desc})...")
+        try:
+            write_simple(dev, addr, ubt_data[:64])
+            log(f"Probe OK! Uploading {len(ubt_data)//1024}KB...", "OK")
+            if write_memory(dev, addr, ubt_data):
+                log(f"UBOOT uploaded to 0x{addr:08x}!", "OK")
+                run(dev, addr)
+                break
+        except Exception as e:
+            log(f"Probe failed: {str(e)[:50]}")
 
     log("\n" + "=" * 60)
     log("DDR+UBOOT uploaded! U-Boot should now be running.", "OK")
