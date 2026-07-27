@@ -178,18 +178,21 @@ def main():
     run(dev, DDR_LOAD)
     log("DDR init running... device will re-enumerate", "OK")
     
-    # Wait and re-find device
+    # Wait and re-find device (DDR init causes USB reset)
     log("Waiting for device to re-enumerate...", "STEP")
-    time.sleep(3)
-    for i in range(20):
+    # DDR init takes ~2-5 seconds on GXL, then device reappears
+    time.sleep(8)
+    dev = None
+    for i in range(30):
+        time.sleep(1)
         dev = find_device()
         if dev:
-            log(f"Device reconnected (attempt {i+1})", "OK")
+            log(f"Device reconnected after {8+i}s", "OK")
             break
-        time.sleep(1)
     
     if not dev:
-        log("Device did not reconnect!", "FAIL")
+        log("Device did not reconnect within 38 seconds!", "FAIL")
+        log("Try: power cycle the box, then re-run", "INFO")
         sys.exit(1)
 
     # === Step 3: Upload UBOOT ===
