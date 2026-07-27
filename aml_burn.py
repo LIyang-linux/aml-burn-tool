@@ -164,49 +164,24 @@ def main():
 
     log(f"\nFiles: DDR={len(ddr_data)} UBOOT={len(ubt_data)} boot={len(boot_data)//1024//1024}MB system={len(sys_data)//1024//1024}MB")
 
-    # === Step 1: Upload to DDR ===
+    # === Step 1: Upload DDR (don't run yet) ===
     log(f"\nStep 1: Upload DDR to 0x{DDR_LOAD:08x}", "STEP")
     if not write_memory(dev, DDR_LOAD, ddr_data):
         log("DDR upload failed!", "FAIL")
         sys.exit(1)
     log("DDR uploaded", "OK")
 
-    time.sleep(1)
-
-    # === Step 2: Run DDR — device WILL re-enumerate ===
-    log(f"\nStep 2: Run DDR at 0x{DDR_LOAD:08x}", "STEP")
-    run(dev, DDR_LOAD)
-    log("DDR init running... device will re-enumerate", "OK")
-    
-    # Wait and re-find device (DDR init causes USB reset)
-    log("Waiting for device to re-enumerate...", "STEP")
-    # DDR init takes ~2-5 seconds on GXL, then device reappears
-    time.sleep(8)
-    dev = None
-    for i in range(30):
-        time.sleep(1)
-        dev = find_device()
-        if dev:
-            log(f"Device reconnected after {8+i}s", "OK")
-            break
-    
-    if not dev:
-        log("Device did not reconnect within 38 seconds!", "FAIL")
-        log("Try: power cycle the box, then re-run", "INFO")
-        sys.exit(1)
-
-    # === Step 3: Upload UBOOT ===
-    log(f"\nStep 3: Upload UBOOT to 0x{UBOOT_LOAD:08x}", "STEP")
+    # === Step 2: Upload UBOOT (while still in Boot ROM) ===
+    log(f"\nStep 2: Upload UBOOT to 0x{UBOOT_LOAD:08x}", "STEP")
     if not write_memory(dev, UBOOT_LOAD, ubt_data):
         log("UBOOT upload failed!", "FAIL")
         sys.exit(1)
     log("UBOOT uploaded", "OK")
 
-    time.sleep(1)
-
-    # === Step 4: Run UBOOT ===
-    log(f"\nStep 4: Run UBOOT at 0x{UBOOT_LOAD:08x}", "STEP")
-    run(dev, UBOOT_LOAD)
+    # === Step 3: Run DDR (Boot ROM chains to UBOOT automatically) ===
+    log(f"\nStep 3: Run DDR at 0x{DDR_LOAD:08x}", "STEP")
+    log("DDR will init memory, then Boot ROM chains to UBOOT at 0x0200c000")
+    run(dev, DDR_LOAD)
 
     log("\n" + "=" * 60)
     log("ALL DONE! eMMC burning via USB not yet implemented.", "OK")
