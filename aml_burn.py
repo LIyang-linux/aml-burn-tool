@@ -24,15 +24,31 @@ def find():
     return None
 
 def wmem(dev, addr, data):
-    """write_memory in 64B chunks."""
+    """write_memory with delay between chunks."""
     t = time.time()
     p = 0
+    errors = 0
     while p < len(data):
         c = data[p:p+BLOCK]
         a = addr + p
-        dev.ctrl_transfer(0x40, 0x01, (a>>16)&0xFFFF, a&0xFFFF, c, timeout=5000)
-        p += len(c)
-        if p % (BLOCK*200) == 0:
+        try:
+            dev.ctrl_transfer(0x40, 0x01, (a>>16)&0xFFFF, a&0xFFFF, c, timeout=5000)
+            errors = 0
+            p += len(c)
+            time.sleep(0.001)  # 1ms gap
+        except Exception as e:
+            errors += 1
+            if errors > 20:
+                log(f"Failed at {p//1024}KB: {e}", "ERR")
+                return False
+            time.sleep(0.1)
+            # Re-claim
+            try:
+                dev.set_configuration()
+                usb.util.claim_interface(dev, 0)
+            except:
+                pass
+        if p % (BLOCK*100) == 0:
             print(f"\r  {p*100//len(data)}% {p/1024/max(.01,time.time()-t):.0f}KB/s", end="", flush=True)
     print(f"\r  100% ({len(data)//1024}KB, {time.time()-t:.0f}s)")
     return True
