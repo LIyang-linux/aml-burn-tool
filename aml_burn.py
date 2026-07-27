@@ -157,35 +157,26 @@ def main():
         ddr_data = f.read()
     with open(ubt_path, "rb") as f:
         ubt_data = f.read()
-    with open(boot_path, "rb") as f:
-        boot_data = f.read()
-    with open(sys_path, "rb") as f:
-        sys_data = f.read()
 
-    log(f"\nFiles: DDR={len(ddr_data)} UBOOT={len(ubt_data)} boot={len(boot_data)//1024//1024}MB system={len(sys_data)//1024//1024}MB")
+    # Concatenate DDR + UBOOT as one payload for Boot ROM
+    fip_data = ddr_data + ubt_data
+    log(f"\nDDR: {len(ddr_data)} UBOOT: {len(ubt_data)} Combined: {len(fip_data)}")
 
-    # === Step 1: Upload DDR (don't run yet) ===
-    log(f"\nStep 1: Upload DDR to 0x{DDR_LOAD:08x}", "STEP")
-    if not write_memory(dev, DDR_LOAD, ddr_data):
-        log("DDR upload failed!", "FAIL")
+    # === Step 1: Upload combined FIP to 0xd9000000 ===
+    log(f"\nUploading DDR+UBOOT combined ({len(fip_data)//1024}KB)...", "STEP")
+    log("Boot ROM will automatically chain DDR → U-Boot")
+    if not write_memory(dev, DDR_LOAD, fip_data):
+        log("Upload failed!", "FAIL")
         sys.exit(1)
-    log("DDR uploaded", "OK")
+    log("FIP uploaded", "OK")
 
-    # === Step 2: Upload UBOOT (while still in Boot ROM) ===
-    log(f"\nStep 2: Upload UBOOT to 0x{UBOOT_LOAD:08x}", "STEP")
-    if not write_memory(dev, UBOOT_LOAD, ubt_data):
-        log("UBOOT upload failed!", "FAIL")
-        sys.exit(1)
-    log("UBOOT uploaded", "OK")
-
-    # === Step 3: Run DDR (Boot ROM chains to UBOOT automatically) ===
-    log(f"\nStep 3: Run DDR at 0x{DDR_LOAD:08x}", "STEP")
-    log("DDR will init memory, then Boot ROM chains to UBOOT at 0x0200c000")
+    # === Step 2: Run ===
+    log(f"\nRunning at 0x{DDR_LOAD:08x}", "STEP")
     run(dev, DDR_LOAD)
 
     log("\n" + "=" * 60)
-    log("ALL DONE! eMMC burning via USB not yet implemented.", "OK")
-    log("(need to reverse U-Boot USB gadget protocol)", "INFO")
+    log("DDR+UBOOT uploaded! U-Boot should now be running.", "OK")
+    log("After U-Boot runs, device will appear as USB gadget for eMMC writes.", "INFO")
     log("=" * 60)
 
 
