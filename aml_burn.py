@@ -39,12 +39,18 @@ def log(msg, level="INFO"):
     print(f"{icon.get(level, '  ')}{msg}", flush=True)
 
 
-def find():
+def find(reset=False):
+    """Find device, optionally with full reset."""
     devs = list(usb.core.find(find_all=True, idVendor=VID, idProduct=PID))
     if not devs:
         return None
     d = devs[0]
     try:
+        if reset:
+            try:
+                d.reset()
+            except:
+                pass
         d.set_configuration()
         usb.util.claim_interface(d, 0)
     except:
@@ -188,15 +194,20 @@ def main():
         run_addr(dev, DDR_LOAD + 0x10)  # Entry point offset
         time.sleep(2)
         
-        # Re-find after DDR
-        log("Re-find device...")
-        time.sleep(5)
+        # Re-find — old device is gone after DDR
+        log("Re-find after DDR...")
+        try:
+            usb.util.dispose_resources(dev)
+        except:
+            pass
+        dev = None
+        time.sleep(3)
         for i in range(30):
             time.sleep(1)
-            dev2 = find()
+            dev2 = find(reset=(i==0))  # reset on first attempt
             if dev2:
                 dev = dev2
-                log(f"Reconnected after {5+i}s", "OK")
+                log(f"Reconnected ({3+i}s)", "OK")
                 break
         
         # Try AMLC again
