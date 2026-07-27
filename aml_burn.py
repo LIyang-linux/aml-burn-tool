@@ -173,10 +173,24 @@ def main():
 
     time.sleep(1)
 
-    # === Step 2: Run DDR ===
+    # === Step 2: Run DDR — device WILL re-enumerate ===
     log(f"\nStep 2: Run DDR at 0x{DDR_LOAD:08x}", "STEP")
     run(dev, DDR_LOAD)
-    log("DDR init running...", "OK")
+    log("DDR init running... device will re-enumerate", "OK")
+    
+    # Wait and re-find device
+    log("Waiting for device to re-enumerate...", "STEP")
+    time.sleep(3)
+    for i in range(20):
+        dev = find_device()
+        if dev:
+            log(f"Device reconnected (attempt {i+1})", "OK")
+            break
+        time.sleep(1)
+    
+    if not dev:
+        log("Device did not reconnect!", "FAIL")
+        sys.exit(1)
 
     # === Step 3: Upload UBOOT ===
     log(f"\nStep 3: Upload UBOOT to 0x{UBOOT_LOAD:08x}", "STEP")
