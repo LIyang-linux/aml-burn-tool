@@ -34,6 +34,13 @@ case "$OS" in
     alpine)
         log "Installing libusb-compat + eudev..."
         apk add --no-cache libusb-compat eudev
+        setup-devd udev 2>/dev/null || true
+        rc-update add udev 2>/dev/null || true
+        rc-service udev start 2>/dev/null || true
+        # Create compat symlink for old libusb binaries
+        if [ ! -f /usr/lib/libusb-0.1.so.4 ]; then
+            ln -sf /usr/lib/libusb.so /usr/lib/libusb-0.1.so.4 2>/dev/null
+        fi
         ;;
     debian)
         log "Installing libusb-0.1-4..."
@@ -68,9 +75,8 @@ EOF
 # Reload udev
 case "$OS" in
     alpine)
-        udevadm control --reload-rules 2>/dev/null || true
+        udevadm control --reload-rules 2>/dev/null || udevadm control --reload 2>/dev/null || true
         udevadm trigger 2>/dev/null || true
-        rc-update add udev 2>/dev/null || true
         ;;
     debian|fedora)
         udevadm control --reload-rules 2>/dev/null || true
