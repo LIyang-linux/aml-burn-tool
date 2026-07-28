@@ -84,6 +84,12 @@ esac
 
 log "Done!"
 echo ""
+
+# Link aml-flash-tool.sh for direct .img flashing
+cp "$DIR/aml-flash-tool.sh" /usr/local/bin/aml-flash-tool.sh
+chmod +x /usr/local/bin/aml-flash-tool.sh
+
+echo ""
 echo "Usage:"
 echo "  update scan          — scan for Amlogic device"
 echo "  update identify      — check device identity"
