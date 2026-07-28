@@ -17,7 +17,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 RESET='\033[m'
-TOOL_PATH="$(dirname $(readlink -fm $(which $0)))"
+TOOL_PATH="$(cd "$(dirname "$0")" && pwd)"
 SYSTEM='linux-x86'
 EXE=
 
