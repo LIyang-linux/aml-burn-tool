@@ -60,9 +60,9 @@ case "$OS" in
         ;;
 esac
 
-# Install update binary
+# Install update binary (in tools/linux-x86/ where aml-flash-tool.sh expects it)
 log "Installing update binary to /usr/local/bin/update..."
-cp "$DIR/update" /usr/local/bin/update
+cp "$DIR/tools/linux-x86/update" /usr/local/bin/update
 chmod +x /usr/local/bin/update
 
 # Install udev rules for non-root access
