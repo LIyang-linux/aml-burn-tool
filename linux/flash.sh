@@ -1,63 +1,54 @@
 #!/bin/sh
-# flash.sh — B860AV2.1-A one-click flash
-# Usage: ./flash.sh [directory_with_partition_files]
+# flash.sh — Python DDR init + update partition flash
+# Phase 1: Python loads DDR/BL2 via control transfer (xHCI/CTRL safe)
+# Phase 2: update tool flashes partitions via bulk (BL2/TLP required)
+
+set -e
 
 DIR="${1:-.}"
-
 RED='\033[31m'; GREEN='\033[32m'; CYAN='\033[36m'; NC='\033[0m'
 log()   { echo "${GREEN}[+]${NC} $1"; }
 info()  { echo "${CYAN}[*]${NC} $1"; }
 err()   { echo "${RED}[!]${NC} $1"; exit 1; }
 
-# Check update tool
-if ! command -v update >/dev/null 2>&1; then
-    err "update tool not found! Run ./install.sh first"
-fi
-
-# Verify device is connected
-info "Scanning for Amlogic device..."
-if ! update scan 2>/dev/null | grep -q "1b8e:c003"; then
-    err "No Amlogic device found!
-  → Enter USB download mode: power off → hold reset → USB in → release
-  → Then re-run: ./flash.sh $DIR"
-fi
-log "Device found"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Check files
-cd "$DIR"
-for f in DDR.USB UBOOT.USB boot.PARTITION system.PARTITION bootloader.PARTITION; do
-    if [ ! -f "$f" ]; then
-        err "Missing: $f (in $DIR)"
+for f in DDR.USB UBOOT.USB; do
+    [ -f "$DIR/$f" ] || err "Missing $DIR/$f"
+done
+
+# === Phase 1: Python DDR init ===
+info "Phase 1: Python DDR init (control transfer)..."
+python3 "$SCRIPT_DIR/../ddr_init.py" "$DIR" || err "DDR init failed!"
+
+# === Phase 2: Wait for BL2/U-Boot ===
+info "Phase 2: Waiting for U-Boot..."
+for i in $(seq 1 30); do
+    if update identify 2>/dev/null | grep -qi "firmware"; then
+        log "U-Boot ready ($i s)"
+        break
     fi
+    sleep 1
 done
+update identify 2>/dev/null | grep -qi "firmware" || err "U-Boot not responding!"
 
-info "Ready to flash. This will overwrite eMMC."
-info "Files:"
-for f in DDR.USB UBOOT.USB bootloader.PARTITION boot.PARTITION system.PARTITION; do
-    sz=$(ls -lh "$f" 2>/dev/null | awk '{print $5}')
-    [ -n "$sz" ] && echo "  $f ($sz)"
-done
-echo ""
+# === Phase 3: Flash partitions ===
+if [ -f "$DIR/boot.PARTITION" ]; then
+    sz=$(ls -lh "$DIR/boot.PARTITION" | awk '{print $5}')
+    info "Flashing boot ($sz)..."
+    update partition boot "$DIR/boot.PARTITION" || err "boot flash failed!"
+    log "boot done"
+fi
 
-# === Flashing sequence ===
-# 1. DDR + UBOOT (uploaded automatically by update tool via AMLC protocol)
-# 2. bootloader
-# 3. boot partition
-# 4. system partition
+if [ -f "$DIR/system.PARTITION" ]; then
+    sz=$(ls -lh "$DIR/system.PARTITION" | awk '{print $5}')
+    info "Flashing system ($sz)..."
+    update partition system "$DIR/system.PARTITION" || err "system flash failed!"
+    log "system done"
+fi
 
-log "Step 1/4: Flashing bootloader..."
-update partition bootloader bootloader.PARTITION
-
-log "Step 2/4: Flashing boot partition..."
-update partition boot boot.PARTITION
-
-log "Step 3/4: Flashing system partition..."
-update partition system system.PARTITION
-
-log "Step 4/4: Done! Rebooting..."
+# === Phase 4: Reboot ===
+info "Rebooting..."
 update bulkcmd "reset" 2>/dev/null || true
-
-echo ""
-echo "============================================"
-echo "  Flash complete! Device rebooting..."
-echo "============================================"
+log "Done! Remove USB and power cycle."
