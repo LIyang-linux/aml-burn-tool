@@ -49,7 +49,8 @@ import time
 import gzip
 import argparse
 
-# ---- 确保能导入同目录的 pyamlboot 包 ----
+# ---- 导入 pyamlboot 库 (支持包目录和平铺两种布局) ----
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
@@ -60,7 +61,17 @@ except ImportError:
     print("  安装: pip install pyusb")
     sys.exit(1)
 
-from pyamlboot.pyamlboot import AmlogicSoC
+try:
+    # 平铺布局: pyamlboot.py 在同目录
+    from pyamlboot import AmlogicSoC
+except ImportError:
+    try:
+        # 包布局: pyamlboot/ 子目录
+        from pyamlboot.pyamlboot import AmlogicSoC
+    except ImportError:
+        print("错误: 找不到 pyamlboot.py")
+        print("  请确保 pyamlboot.py 和 burn.py 在同一目录")
+        sys.exit(1)
 
 # ============================================================
 #  平台常量 — GXL (S905L/S905L3/S905L3B)
