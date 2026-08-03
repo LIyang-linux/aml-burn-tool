@@ -1,0 +1,20 @@
+Windows Registry Editor Version 5.00
+
+; ============================================================
+;  Amlogic USB Burning Tool 注册表补丁
+;  兼容国产 eMMC (Foresee/Biwin/YTXC, mafId=0xD6)
+;
+;  修改内容:
+;   - EraseBootloader = 0  (跳过擦除 bootloader, 避免超时)
+;   - EraseFlash = 1       (普通擦除)
+;   - VerifyFlash = 1      (写入后校验)
+;   - PreserveData = 0     (不保留用户数据)
+; ============================================================
+
+[HKEY_CURRENT_USER\Software\Amlogic\USB_Burning_Tool\Settings]
+"EraseBootloader"=dword:00000000
+"EraseFlash"=dword:00000001
+"VerifyFlash"=dword:00000001
+"PreserveData"=dword:00000000
+"AutoDetect"=dword:00000001
+"ResetAfterBurn"=dword:00000000

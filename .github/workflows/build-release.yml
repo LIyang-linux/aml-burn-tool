@@ -1,0 +1,110 @@
+# aml-burn-tool 自动构建发布
+# 每次 push 到 main 自动打包为 zip 并发布 Release
+
+name: Build Release
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'windows/**'
+      - 'linux/**'
+      - 'python/**'
+      - 'README.md'
+      - '.github/workflows/build-release.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build date
+        id: date
+        run: |
+          echo "date=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
+          echo "datetime=$(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_OUTPUT
+
+      - name: Prepare release package
+        run: |
+          mkdir -p release/aml-burn-tool
+
+          # 复制所有文件到 release 目录
+          cp -r windows release/aml-burn-tool/
+          cp -r linux release/aml-burn-tool/
+          cp -r python release/aml-burn-tool/
+          cp README.md release/aml-burn-tool/ 2>/dev/null || true
+
+          # 生成使用说明
+          cat > release/aml-burn-tool/快速使用.txt << 'EOF'
+          ============================================================
+            Amlogic 烧录工具包 — 国产 eMMC 兼容版
+          ============================================================
+
+          【Windows 用户】
+          1. 安装 Amlogic USB Burning Tool v2.1.6+
+          2. 进入 windows/ 目录
+          3. 右键 launcher.bat → 以管理员身份运行
+          4. 在 GUI 中取消勾选 Erase bootloader
+          5. 导入 .img 文件, 点 Start
+
+          【Linux 用户】
+          1. cd linux/
+          2. sudo ./install.sh
+          3. sudo ./flash.sh /path/to/files
+
+          【Python 替代方案】 (无需 USB Burning Tool)
+          1. pip install pyusb libusb0
+          2. cd windows/ (或 python/)
+          3. python win_flash.py /path/to/files
+
+          ============================================================
+          EOF
+
+          # 计算 md5
+          cd release
+          find . -type f -exec md5sum {} \; > checksums.md5
+
+          # 打包 zip
+          cd ..
+          zip -r aml-burn-tool-${{ steps.date.outputs.date }}.zip release/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aml-burn-tool-${{ steps.date.outputs.date }}
+          path: aml-burn-tool-${{ steps.date.outputs.date }}.zip
+          retention-days: 30
+
+      - name: Create Release
+        run: |
+          TAG="v${{ steps.date.outputs.date }}"
+          gh release create "$TAG" \
+            --title "aml-burn-tool ${{ steps.date.outputs.date }}" \
+            --notes-file - \
+            aml-burn-tool-${{ steps.date.outputs.date }}.zip << EOF
+          ## aml-burn-tool ${{ steps.date.outputs.date }}
+
+          **国产 eMMC 兼容版 — 跳过 ERASE BOOTLOADER 超时**
+
+          ### 包含内容
+          - **windows/**: 魔改启动器 + DLL超时补丁 + 注册表补丁 + 配置补丁
+          - **linux/**: Linux USB 烧录工具 (update + aml_image_v2_packer)
+          - **python/**: Python 纯烧录方案 (无需官方工具)
+
+          ### Windows 使用
+          1. 安装 Amlogic USB Burning Tool v2.1.6+
+          2. 解压本包, 进入 windows/ 目录
+          3. 右键 launcher.bat → 以管理员身份运行
+          4. GUI 中取消勾选 Erase bootloader, 导入 .img, Start
+
+          ### 构建时间
+          ${{ steps.date.outputs.datetime }}
+          EOF
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
