@@ -4,22 +4,33 @@
 """
 Amlogic USB Boot & Flash Tool — 基于 pyamlboot 协议库
 
-两阶段加载烧录脚本，适配中兴 B860AV2.1-A (S905L3-B / GXL 平台)
+严格遵循 pyamlboot 官方协议 (https://github.com/superna9999/pyamlboot)
+适配中兴 B860AV2.1-A (S905L3-B / GXL 平台)
 
-启动链:
-  ROM (BL1) → BL2 (DDR.USB) → TPL/U-Boot (UBOOT.USB) → eMMC 烧录
+启动链 (三阶段, 严格匹配官方 pyamlboot boot.py):
 
-阶段 1 — ROM 模式 (VID=1b8e PID=c003, stage=0):
-  ① 上传 DDR.USB (BL2) 到 0xd9000000
-  ② 写入 BL2 参数到 0xd900c000 (U-Boot 加载地址 + 大小)
-  ③ 运行 BL2 → 初始化 DDR 内存 → 设备重新枚举
+  阶段 A — init_ddr (ROM 模式, stage=0):
+    ① identify → 确认 stage=0
+    ② writeMemory: BL2 (DDR.USB) → 0xd9000000  (小数据, writeMemory)
+    ③ writeLargeMemory: usbbl2runpara_ddrinit.bin → 0xd900c000  (blockLength=32)
+    ④ run(0xd9000000) → BL2 初始化 DDR
+    ⑤ 等待 1s, identify → 确认 stage=8
+    ⑥ run(0xd900c000) → BL2 读取 ddrinit 参数, 进入下一阶段
 
-阶段 2 — BL2 模式 (PID 不变, stage=8):
-  ④ 上传 UBOOT.USB (TPL) 到 0x10000000
-  ⑤ 运行 U-Boot → USB 烧录接口就绪
+  阶段 B — load_uboot (BL2 模式, stage=8):
+    ⑦ writeLargeMemory: BL2 (DDR.USB) → 0xd9000000  (再次写入, blockLength=64)
+    ⑧ writeLargeMemory: usbbl2runpara_runfipimg.bin → 0xd900c000  (blockLength=48)
+    ⑨ writeLargeMemory: TPL (UBOOT.USB) → 0x200c000  (blockLength=64, appendZeros)
+    ⑩ run(0xd900c000) → BL2 加载并运行 TPL/U-Boot
 
-阶段 3 — U-Boot 烧录:
-  ⑥ 通过 bulkCmd 擦除 + 写入各分区到 eMMC
+  阶段 C — U-Boot 烧录:
+    ⑪ 通过 bulkCmd 擦除 + 下载 + 写入各分区到 eMMC
+
+关键区别 (与之前错误版本对比):
+  - BL2 写入两次: 第1次用 writeMemory (小), 第2次用 writeLargeMemory (大)
+  - 参数使用 usbbl2runpara 二进制文件, 不是手动构造 struct
+  - TPL 加载到 0x200c000 (不是 0x10000000)
+  - 最终 run(0xd900c000) 是参数地址 (不是 BL2 地址)
 
 用法:
   python burn.py <文件目录> [--no-flash] [--dry-run]
@@ -30,12 +41,11 @@ Amlogic USB Boot & Flash Tool — 基于 pyamlboot 协议库
 依赖:
   pip install pyusb
   Linux: apt install libusb-1.0-0
-  Windows: 通过 Zadig 安装 libusb0 或 WinUSB 驱动
+  Windows: 通过 Zadig 安装 libusb-win32 或 WinUSB 驱动
 """
 import sys
 import os
 import time
-import struct
 import argparse
 
 # ---- 确保能导入同目录的 pyamlboot 包 ----
@@ -53,17 +63,25 @@ from pyamlboot.pyamlboot import AmlogicSoC
 
 # ============================================================
 #  平台常量 — GXL (S905L/S905L3/S905L3B)
+#  来自 pyamlboot 官方 boot.py GX Family 参数
 # ============================================================
 
 VID_AMLOGIC = 0x1b8e
 PID_ROM     = 0xc003   # ROM/BL2 模式
 PID_UBOOT   = 0xc004   # U-Boot 模式 (部分固件使用)
 
-# 内存地址 (来自 platform.conf)
-DDR_LOAD_ADDR  = 0xd9000000   # BL2 (DDR.USB) 加载地址
-DDR_RUN_ADDR   = 0xd9000030   # BL2 运行入口 (部分平台 = DDR_LOAD + 0x30)
-DDR_PRMS_ADDR  = 0xd900c000   # BL2 参数区
-UBOOT_LOAD_ADDR = 0x10000000  # U-Boot (UBOOT.USB) 加载地址
+# 内存地址 — 严格匹配 pyamlboot GX Family
+DDR_LOAD_ADDR   = 0xd9000000   # BL2 (DDR.USB) 加载地址
+BL2_PARAMS_ADDR = 0xd900c000   # BL2 参数区 (usbbl2runpara 文件)
+UBOOT_LOAD_ADDR = 0x0200c000   # TPL (UBOOT.USB) 加载地址 (注意: 不是 0x10000000!)
+
+# 参数文件
+DDR_INIT_FILE   = "usbbl2runpara_ddrinit.bin"     # DDR 初始化参数 (32 字节)
+FIP_RUN_FILE    = "usbbl2runpara_runfipimg.bin"    # FIP 加载参数 (48 字节)
+
+# 文件名映射 (Amlogic 烧录工具 → pyamlboot 命名)
+# DDR.USB        = u-boot.bin.usb.bl2  (BL2)
+# UBOOT.USB      = u-boot.bin.usb.tpl  (TPL/U-Boot)
 
 # stage 值 (identify 返回的第 4 字节)
 STAGE_ROM   = 0    # BL1 ROM
@@ -71,9 +89,8 @@ STAGE_BL2   = 8    # BL2/SPL (DDR 已初始化)
 STAGE_TPL   = 16   # TPL/U-Boot
 
 # USB 超时
-USB_TIMEOUT      = 10000    # 10s 控制传输
-BULK_TIMEOUT     = 30000    # 30s 批量传输
 DEVICE_WAIT_MAX  = 30       # 等待设备重新枚举最大秒数
+BULK_TIMEOUT     = 30000    # 30s 批量传输
 
 # 烧录分区定义
 PARTITIONS = [
@@ -128,7 +145,7 @@ def fmt_size(n):
 
 
 # ============================================================
-#  设备查找 — 支持重新枚举后查找
+#  设备查找
 # ============================================================
 
 def find_device(vid=VID_AMLOGIC, pid=PID_ROM, timeout=DEVICE_WAIT_MAX):
@@ -141,7 +158,7 @@ def find_device(vid=VID_AMLOGIC, pid=PID_ROM, timeout=DEVICE_WAIT_MAX):
                 dev.set_configuration()
                 usb.util.claim_interface(dev, 0)
             except usb.core.USBError:
-                pass  # 可能已被内核驱动占用
+                pass
             return dev
         time.sleep(0.2)
     return None
@@ -168,127 +185,205 @@ def release_device(dev):
         except Exception:
             pass
 
-
-# ============================================================
-#  阶段 1: ROM 模式 — 上传 BL2, 初始化 DDR
-# ============================================================
-
-def stage1_rom_upload(dev, ddr_data):
-    """
-    ROM 阶段: 上传 DDR.USB (BL2) 到 SRAM, 设置参数, 运行 BL2
-
-    流程:
-      1. identify → 确认 stage=0 (ROM)
-      2. writeLargeMemory → 上传 BL2 到 0xd9000000
-      3. writeMemory → 写入 BL2 参数 (U-Boot 地址 + 大小)
-      4. run → 执行 BL2 (初始化 DDR)
-    """
+def make_soc(dev):
+    """从已有 dev 创建 AmlogicSoC 实例 (跳过 __init__ 的设备查找)"""
     soc = AmlogicSoC.__new__(AmlogicSoC)
     soc.dev = dev
+    return soc
 
-    # 1. 确认 ROM 阶段
-    log("[1/5] 识别芯片阶段...")
+
+# ============================================================
+#  阶段 A: init_ddr — ROM 模式, 上传 BL2, 初始化 DDR
+#  严格匹配 pyamlboot boot.py init_ddr() 方法
+# ============================================================
+
+def init_ddr(dev, bl2_data, ddrinit_params, params_dir):
+    """
+    ROM 阶段: 上传 BL2, 初始化 DDR
+
+    匹配 pyamlboot boot.py:
+      soc_id()                           → identify
+      write_file(BL2, DDR_LOAD)          → writeMemory (小数据)
+      write_file(DDR_INIT, BL2_PARAMS, large=32)  → writeLargeMemory
+      run(DDR_LOAD)                      → run BL2
+      wait(1) + soc_id()                 → 确认 stage=8
+      run(BL2_PARAMS)                    → 运行 ddrinit 参数
+      wait(1)
+    """
+    soc = make_soc(dev)
+
+    # 1. identify — 确认 ROM 阶段
+    log("[1/6] 识别芯片阶段...")
     try:
         raw = soc.identify()
-        stage = raw[3] if len(raw) >= 4 else -1
-        stage_name = {0: "ROM (BL1)", 8: "BL2/SPL", 16: "TPL/U-Boot"}.get(stage, f"未知({stage})")
-        log(f"  芯片阶段: {stage_name}")
+        rom_major = raw[0] if len(raw) > 0 else 0
+        rom_minor = raw[1] if len(raw) > 1 else 0
+        stage = raw[3] if len(raw) > 3 else -1
+        log(f"  ROM: {rom_major}.{rom_minor} Stage: {raw[2] if len(raw) > 2 else 0}.{stage}")
         if stage != STAGE_ROM:
             log(f"  警告: 期望 ROM 阶段(0), 实际为 {stage}")
             log(f"  设备可能已部分加载, 尝试继续...")
     except Exception as e:
         log(f"  identify 失败: {e} (继续尝试...)")
 
-    # 2. 上传 BL2 (DDR.USB) 到 0xd9000000
-    log(f"[2/5] 上传 BL2 (DDR.USB) → 0x{DDR_LOAD_ADDR:08x} ...")
-    log(f"  大小: {fmt_size(len(ddr_data))}")
+    # 2. writeMemory: 上传 BL2 (DDR.USB) 到 0xd9000000
+    #    官方 pyamlboot 第一次用 writeMemory (小块传输)
+    log(f"[2/6] 上传 BL2 (DDR.USB) → 0x{DDR_LOAD_ADDR:08x} (writeMemory) ...")
+    log(f"  大小: {fmt_size(len(bl2_data))}")
     t0 = time.time()
     try:
-        soc.writeLargeMemory(DDR_LOAD_ADDR, ddr_data, blockLength=64, appendZeros=True)
+        soc.writeMemory(DDR_LOAD_ADDR, bl2_data)
     except Exception as e:
         log(f"  错误: 上传 BL2 失败: {e}")
         return False
     log(f"  完成 ({time.time()-t0:.1f}s)")
 
-    # 3. 写入 BL2 参数
-    # 参数结构: U-Boot 加载地址, 入口(0=默认), 大小, ...
-    log(f"[3/5] 写入 BL2 参数 → 0x{DDR_PRMS_ADDR:08x} ...")
-    params = struct.pack('<16I',
-        UBOOT_LOAD_ADDR,   # U-Boot 加载地址
-        0,                  # 入口 (0 = 使用加载地址)
-        len(ddr_data),      # BL2 大小 (部分固件需要)
-        0, 0, 0, 0, 0,      # reserved
-        0, 0, 0, 0, 0, 0, 0, 0
-    )
+    # 3. writeLargeMemory: 写入 usbbl2runpara_ddrinit.bin 到 0xd900c000
+    #    官方 pyamlboot 使用 large=32 (blockLength=32)
+    log(f"[3/6] 写入 DDR 初始化参数 → 0x{BL2_PARAMS_ADDR:08x} (blockLength=32) ...")
+    log(f"  文件: {DDR_INIT_FILE} ({len(ddrinit_params)} 字节)")
     try:
-        soc.writeMemory(DDR_PRMS_ADDR, params)
+        soc.writeLargeMemory(BL2_PARAMS_ADDR, ddrinit_params, blockLength=32)
     except Exception as e:
         log(f"  错误: 写入参数失败: {e}")
         return False
     log("  完成")
 
-    # 4. 运行 BL2 — 初始化 DDR
-    log(f"[4/5] 运行 BL2 (DDR 初始化) @ 0x{DDR_LOAD_ADDR:08x} ...")
+    # 4. run(0xd9000000) — 执行 BL2, 初始化 DDR
+    log(f"[4/6] 运行 BL2 @ 0x{DDR_LOAD_ADDR:08x} (DDR 初始化) ...")
     try:
         soc.run(DDR_LOAD_ADDR, keep_power=True)
     except Exception as e:
-        # usb.core.USBError 是正常的 — 设备会断开重连
         if "timed out" in str(e).lower() or "pipe" in str(e).lower():
             log("  设备断开 (正常行为)")
         else:
             log(f"  注意: {e}")
 
-    log("[5/5] BL2 已启动, 等待设备重新枚举...")
+    # 5. 等待 1s, identify — 确认进入 BL2 阶段 (stage=8)
+    log("[5/6] 等待设备重新枚举 (1s) ...")
+    time.sleep(1)
+    soc = make_soc(dev)  # 重新创建 (设备可能已重置)
+    try:
+        raw = soc.identify()
+        stage = raw[3] if len(raw) > 3 else -1
+        log(f"  ROM: {raw[0]}.{raw[1]} Stage: {raw[2]}.{stage}")
+        if stage == STAGE_BL2:
+            log("  DDR 初始化成功, 进入 BL2 阶段")
+
+            # 6. run(0xd900c000) — 运行 ddrinit 参数 (BL2 继续执行)
+            log(f"[6/6] 运行 BL2 参数 @ 0x{BL2_PARAMS_ADDR:08x} ...")
+            try:
+                soc.run(BL2_PARAMS_ADDR, keep_power=True)
+            except Exception as e:
+                if "timed out" in str(e).lower() or "pipe" in str(e).lower():
+                    log("  设备断开 (正常行为)")
+                else:
+                    log(f"  注意: {e}")
+        else:
+            log(f"  警告: 期望 stage=8, 实际 stage={stage}")
+            log("  DDR 初始化可能未完成, 尝试继续...")
+    except Exception as e:
+        log(f"  identify 失败: {e}")
+        log("  尝试继续...")
+
+    log("init_ddr 完成")
     return True
 
 
 # ============================================================
-#  阶段 2: BL2 模式 — 上传 U-Boot
+#  阶段 B: load_uboot — BL2 模式, 上传 TPL/U-Boot
+#  严格匹配 pyamlboot boot.py load_uboot() 方法
 # ============================================================
 
-def stage2_bl2_upload(dev, uboot_data):
+def load_uboot(dev, bl2_data, fip_params, uboot_data):
     """
-    BL2 阶段: DDR 已初始化, 上传 UBOOT.USB 并运行
+    BL2 阶段: 上传 BL2 (再次), FIP 参数, TPL
 
-    流程:
-      1. identify → 确认 stage=8 (BL2)
-      2. writeLargeMemory → 上传 U-Boot 到 0x10000000
-      3. run → 执行 U-Boot
+    匹配 pyamlboot boot.py:
+      write_file(BL2, DDR_LOAD, large=64)          → writeLargeMemory (第二次, 大块)
+      write_file(FIP_FILE, BL2_PARAMS, large=48)   → writeLargeMemory
+      write_file(TPL, UBOOT_LOAD, large=64, fill=True) → writeLargeMemory (appendZeros)
     """
-    soc = AmlogicSoC.__new__(AmlogicSoC)
-    soc.dev = dev
+    soc = make_soc(dev)
 
-    # 1. 确认 BL2 阶段
-    log("[1/3] 识别芯片阶段...")
+    # 1. identify — 确认 BL2 阶段
+    log("[1/4] 识别芯片阶段...")
     try:
         raw = soc.identify()
-        stage = raw[3] if len(raw) >= 4 else -1
-        stage_name = {0: "ROM (BL1)", 8: "BL2/SPL", 16: "TPL/U-Boot"}.get(stage, f"未知({stage})")
-        log(f"  芯片阶段: {stage_name}")
-        if stage == STAGE_ROM:
-            log("  警告: 仍然在 ROM 阶段, BL2 可能未成功运行")
-            log("  尝试继续上传 U-Boot...")
-        elif stage == STAGE_TPL:
-            log("  U-Boot 已在运行 (跳过上传)")
+        stage = raw[3] if len(raw) > 3 else -1
+        log(f"  ROM: {raw[0]}.{raw[1]} Stage: {raw[2]}.{stage}")
+        if stage == STAGE_TPL:
+            log("  U-Boot 已在运行 (跳过加载)")
             return True
+        elif stage == STAGE_ROM:
+            log("  警告: 仍在 ROM 阶段, init_ddr 可能未成功")
     except Exception as e:
         log(f"  identify 失败: {e} (继续尝试...)")
 
-    # 2. 上传 U-Boot (UBOOT.USB) 到 0x10000000
-    log(f"[2/3] 上传 U-Boot (UBOOT.USB) → 0x{UBOOT_LOAD_ADDR:08x} ...")
+    # 2. writeLargeMemory: BL2 (DDR.USB) → 0xd9000000 (第二次写入, blockLength=64)
+    log(f"[2/4] 上传 BL2 (DDR.USB) → 0x{DDR_LOAD_ADDR:08x} (writeLargeMemory, blockLength=64) ...")
+    log(f"  大小: {fmt_size(len(bl2_data))}")
+    t0 = time.time()
+    try:
+        soc.writeLargeMemory(DDR_LOAD_ADDR, bl2_data, blockLength=64, appendZeros=True)
+    except Exception as e:
+        log(f"  错误: 上传 BL2 失败: {e}")
+        return False
+    log(f"  完成 ({time.time()-t0:.1f}s)")
+
+    # 3. writeLargeMemory: usbbl2runpara_runfipimg.bin → 0xd900c000 (blockLength=48)
+    log(f"[3/4] 写入 FIP 加载参数 → 0x{BL2_PARAMS_ADDR:08x} (blockLength=48) ...")
+    log(f"  文件: {FIP_RUN_FILE} ({len(fip_params)} 字节)")
+    try:
+        soc.writeLargeMemory(BL2_PARAMS_ADDR, fip_params, blockLength=48)
+    except Exception as e:
+        log(f"  错误: 写入参数失败: {e}")
+        return False
+    log("  完成")
+
+    # 4. writeLargeMemory: TPL (UBOOT.USB) → 0x200c000 (blockLength=64, appendZeros=True)
+    log(f"[4/4] 上传 TPL (UBOOT.USB) → 0x{UBOOT_LOAD_ADDR:08x} (blockLength=64, appendZeros) ...")
     log(f"  大小: {fmt_size(len(uboot_data))}")
     t0 = time.time()
     try:
         soc.writeLargeMemory(UBOOT_LOAD_ADDR, uboot_data, blockLength=64, appendZeros=True)
     except Exception as e:
-        log(f"  错误: 上传 U-Boot 失败: {e}")
+        log(f"  错误: 上传 TPL 失败: {e}")
         return False
     log(f"  完成 ({time.time()-t0:.1f}s)")
 
-    # 3. 运行 U-Boot
-    log(f"[3/3] 运行 U-Boot @ 0x{UBOOT_LOAD_ADDR:08x} ...")
+    log("load_uboot 完成")
+    return True
+
+
+# ============================================================
+#  run_uboot — 执行 U-Boot
+#  匹配 pyamlboot boot.py run_uboot() 方法
+# ============================================================
+
+def run_uboot(dev):
+    """
+    运行 U-Boot:
+      如果 stage==8: run(0xd900c000)  → BL2 读取 FIP 参数, 加载并运行 TPL
+      否则:          run(0xd9000000)  → 直接运行 BL2
+    """
+    soc = make_soc(dev)
+
     try:
-        soc.run(UBOOT_LOAD_ADDR, keep_power=True)
+        raw = soc.identify()
+        stage = raw[3] if len(raw) > 3 else -1
+    except Exception:
+        stage = -1
+
+    if stage == STAGE_BL2:
+        addr = BL2_PARAMS_ADDR
+        log(f"运行 U-Boot: run(0x{addr:08x}) [BL2 → TPL]")
+    else:
+        addr = DDR_LOAD_ADDR
+        log(f"运行 U-Boot: run(0x{addr:08x}) [直接 BL2]")
+
+    try:
+        soc.run(addr, keep_power=True)
     except Exception as e:
         if "timed out" in str(e).lower() or "pipe" in str(e).lower():
             log("  设备响应中断 (正常行为)")
@@ -300,7 +395,7 @@ def stage2_bl2_upload(dev, uboot_data):
 
 
 # ============================================================
-#  阶段 3: U-Boot 烧录 — 擦除 + 写入分区
+#  阶段 C: U-Boot 烧录
 # ============================================================
 
 def wait_for_uboot(dev, timeout=15):
@@ -309,9 +404,7 @@ def wait_for_uboot(dev, timeout=15):
     for i in range(timeout * 5):
         time.sleep(0.2)
         try:
-            # 发送 nop 确认 U-Boot 在响应
-            soc = AmlogicSoC.__new__(AmlogicSoC)
-            soc.dev = dev
+            soc = make_soc(dev)
             soc.nop()
             log(f"U-Boot 就绪 ({i*0.2:.0f}s)")
             return True
@@ -322,8 +415,7 @@ def wait_for_uboot(dev, timeout=15):
 
 def send_bulk_cmd(dev, cmd, read_response=True):
     """发送 bulkcmd 到 U-Boot, 可选读取响应"""
-    soc = AmlogicSoC.__new__(AmlogicSoC)
-    soc.dev = dev
+    soc = make_soc(dev)
     try:
         soc.bulkCmd(cmd)
     except Exception as e:
@@ -333,7 +425,6 @@ def send_bulk_cmd(dev, cmd, read_response=True):
     if not read_response:
         return ""
 
-    # 读取响应 (从 bulk IN 端点)
     time.sleep(0.3)
     try:
         cfg = dev.get_active_configuration()
@@ -371,14 +462,13 @@ def send_bulk_data(dev, data, chunk_size=512*1024):
     while offset < total:
         actual_len = min(chunk_size, total - offset)
         chunk = data[offset:offset + actual_len]
-        # 对齐到 64 字节 (USB 控制传输要求)
         padded = chunk
         if len(padded) % 64 != 0:
             padded = padded + b'\x00' * (64 - len(padded) % 64)
 
         try:
             ep_out.write(padded, timeout=BULK_TIMEOUT)
-            offset += actual_len  # 按实际数据量前进, 不含 padding
+            offset += actual_len
             retry_count = 0
         except Exception as e:
             retry_count += 1
@@ -424,7 +514,7 @@ def flash_partition(dev, part, base_dir):
     resp = send_bulk_cmd(dev, part["cmd_erase"])
     if resp:
         log(f"  擦除响应: {resp.strip()[:80]}")
-    time.sleep(1)  # 等待擦除完成
+    time.sleep(1)
 
     # 2. 准备下载
     cmd = part["cmd_write"].format(size=size)
@@ -441,8 +531,13 @@ def flash_partition(dev, part, base_dir):
         log(f"  错误: 数据传输失败")
         return False
 
-    # 4. 保存
+    # 4. 检查下载状态
     time.sleep(0.5)
+    resp = send_bulk_cmd(dev, "download get_status")
+    if resp:
+        log(f"  状态: {resp.strip()[:80]}")
+
+    # 5. 保存
     log(f"  保存 ...")
     resp = send_bulk_cmd(dev, "save")
     if resp:
@@ -457,28 +552,36 @@ def flash_partition(dev, part, base_dir):
 #  文件检查
 # ============================================================
 
-def check_files(base_dir, dry_run=False):
+def check_files(base_dir, params_dir, dry_run=False):
     """检查所需文件是否齐全"""
     log("检查烧录文件...")
-    required = ["DDR.USB", "UBOOT.USB"]
+    required = [
+        ("DDR.USB", "BL2 引导镜像", base_dir, True),
+        ("UBOOT.USB", "TPL/U-Boot 镜像", base_dir, True),
+        (DDR_INIT_FILE, "DDR 初始化参数", params_dir, True),
+        (FIP_RUN_FILE, "FIP 加载参数", params_dir, True),
+    ]
     for part in PARTITIONS:
         if not part.get("optional"):
-            required.append(part["file"])
+            required.append((part["file"], part["desc"], base_dir, True))
 
     all_found = True
-    for fname in required:
-        path = os.path.join(base_dir, fname)
+    for fname, desc, search_dir, required_flag in required:
+        path = os.path.join(search_dir, fname)
         if os.path.isfile(path):
             size = os.path.getsize(path)
-            log(f"  [OK] {fname:30s} {fmt_size(size):>10s}")
+            log(f"  [OK] {fname:35s} {fmt_size(size):>10s}  {desc}")
         else:
-            tag = "可选" if any(p["file"] == fname and p.get("optional") for p in PARTITIONS) else "缺失"
-            log(f"  [{tag}] {fname:30s}")
-            if tag == "缺失":
+            tag = "缺失" if required_flag else "可选"
+            log(f"  [{tag}] {fname:35s}              {desc}")
+            if required_flag:
                 all_found = False
 
     if not all_found:
         log("\n错误: 必需文件缺失!")
+        log(f"  参数文件 ({DDR_INIT_FILE}, {FIP_RUN_FILE}) 应在:")
+        log(f"    {params_dir}")
+        log(f"  或从 linux/tools/datas/ 目录复制")
         return False
 
     log("文件检查通过")
@@ -491,7 +594,7 @@ def check_files(base_dir, dry_run=False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Amlogic USB Boot & Flash Tool (pyamlboot)",
+        description="Amlogic USB Boot & Flash Tool (pyamlboot 协议)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -505,6 +608,11 @@ def main():
   2. 用牙签/回形针按住 reset 孔 (或短接 AV 口触点)
   3. 插上电源, 2 秒后松开 reset
   4. 设备应出现在 USB 设备列表中 (VID=1b8e PID=c003)
+
+注意:
+  - 需要 usbbl2runpara_ddrinit.bin 和 usbbl2runpara_runfipimg.bin
+    这两个文件已包含在本目录中 (从 pyamlboot 项目获取)
+  - DDR.USB 和 UBOOT.USB 从 B860AV2.1-A Releases 下载
         """
     )
     parser.add_argument("dir", nargs="?", default=".",
@@ -520,14 +628,18 @@ def main():
 
     args = parser.parse_args()
     base_dir = os.path.abspath(args.dir)
+    # 参数文件目录 (本脚本所在目录)
+    params_dir = os.path.dirname(os.path.abspath(__file__))
 
-    header("Amlogic USB Boot & Flash Tool")
+    header("Amlogic USB Boot & Flash Tool (pyamlboot)")
     log(f"文件目录: {base_dir}")
+    log(f"参数目录: {params_dir}")
     log(f"模式: {'检查' if args.dry_run else '仅加载U-Boot' if args.no_flash else '完整烧录'}")
     log(f"平台: GXL (S905L/S905L3/S905L3B)")
+    log(f"协议: pyamlboot 官方三阶段加载")
 
     # ---- 检查文件 ----
-    if not check_files(base_dir, args.dry_run):
+    if not check_files(base_dir, params_dir, args.dry_run):
         sys.exit(1)
 
     if args.dry_run:
@@ -536,15 +648,19 @@ def main():
 
     # ---- 读取文件 ----
     log("\n读取烧录文件...")
-    ddr_data = open(os.path.join(base_dir, "DDR.USB"), "rb").read()
+    bl2_data = open(os.path.join(base_dir, "DDR.USB"), "rb").read()
     uboot_data = open(os.path.join(base_dir, "UBOOT.USB"), "rb").read()
-    log(f"  DDR.USB:  {fmt_size(len(ddr_data))}")
-    log(f"  UBOOT.USB: {fmt_size(len(uboot_data))}")
+    ddrinit_params = open(os.path.join(params_dir, DDR_INIT_FILE), "rb").read()
+    fip_params = open(os.path.join(params_dir, FIP_RUN_FILE), "rb").read()
+    log(f"  DDR.USB (BL2):           {fmt_size(len(bl2_data))}")
+    log(f"  UBOOT.USB (TPL):         {fmt_size(len(uboot_data))}")
+    log(f"  {DDR_INIT_FILE}:   {len(ddrinit_params)} 字节")
+    log(f"  {FIP_RUN_FILE}:  {len(fip_params)} 字节")
 
     # ============================================================
-    #  阶段 1: ROM 模式
+    #  阶段 A: init_ddr — ROM 模式
     # ============================================================
-    header("阶段 1: ROM 模式 — 上传 BL2, 初始化 DDR")
+    header("阶段 A: init_ddr — ROM 模式, 上传 BL2, 初始化 DDR")
 
     log("搜索设备 (VID=1b8e PID=c003)...")
     dev = None
@@ -561,27 +677,27 @@ def main():
         log("  1. 设备已进入 USB 烧录模式 (按住 reset 上电)")
         log("  2. USB 线已连接")
         log("  3. Linux: 安装了 libusb (apt install libusb-1.0-0)")
-        log("  4. Windows: 通过 Zadig 安装了 libusb0/WinUSB 驱动")
+        log("  4. Windows: 通过 Zadig 安装了 libusb-win32/WinUSB 驱动")
         log("  5. 有 root/管理员权限")
+        log("  6. 不要使用 AMD 机器的 USB3 端口 (已知兼容性问题)")
         sys.exit(1)
 
     log("设备已连接")
 
-    ok = stage1_rom_upload(dev, ddr_data)
+    ok = init_ddr(dev, bl2_data, ddrinit_params, params_dir)
     release_device(dev)
     dev = None
 
     if not ok:
-        log("\n错误: 阶段 1 失败!")
+        log("\n错误: init_ddr 失败!")
         sys.exit(1)
 
     # ============================================================
     #  等待设备重新枚举
     # ============================================================
-    log("\n等待设备重新枚举 (BL2 → USB)...")
+    log("\n等待设备重新枚举 (init_ddr → BL2 模式)...")
     time.sleep(2)
 
-    # 设备可能保持 PID=c003 或变为 c004
     dev = find_device(VID_AMLOGIC, PID_ROM, timeout=DEVICE_WAIT_MAX)
     if dev is None:
         log("PID=c003 未找到, 尝试 PID=c004 ...")
@@ -591,35 +707,40 @@ def main():
         dev = find_device_any_pid(VID_AMLOGIC, timeout=5)
 
     if dev is None:
-        log("\n错误: BL2 运行后设备未重新出现!")
+        log("\n错误: init_ddr 后设备未重新出现!")
         log("可能原因:")
         log("  1. BL2 (DDR.USB) 不匹配此设备")
         log("  2. DDR 初始化失败")
-        log("  3. USB 连接不稳定")
+        log("  3. USB 连接不稳定/供电不足")
+        log("  4. AMD USB 控制器兼容性问题")
         sys.exit(1)
 
     log("设备重新连接成功")
     product_id = dev.idProduct
-    log(f"  PID: 0x{product_id:04x} ({'U-Boot' if product_id == PID_UBOOT else 'ROM/BL2'})")
+    log(f"  PID: 0x{product_id:04x}")
 
     # ============================================================
-    #  阶段 2: BL2 模式 — 上传 U-Boot
+    #  阶段 B: load_uboot — BL2 模式, 上传 TPL
     # ============================================================
-    header("阶段 2: BL2 模式 — 上传 U-Boot")
+    header("阶段 B: load_uboot — BL2 模式, 上传 TPL/U-Boot")
 
-    ok = stage2_bl2_upload(dev, uboot_data)
-
-    # 如果 U-Boot 已经在运行 (stage=16), 不需要重新上传
+    ok = load_uboot(dev, bl2_data, fip_params, uboot_data)
     if not ok:
-        log("\n错误: 阶段 2 失败!")
+        log("\n错误: load_uboot 失败!")
         release_device(dev)
         sys.exit(1)
 
-    # 等待 U-Boot USB 接口就绪
-    # 设备可能再次重新枚举
-    time.sleep(3)
+    # ============================================================
+    #  run_uboot — 执行 U-Boot
+    # ============================================================
+    header("运行 U-Boot")
+
+    ok = run_uboot(dev)
     release_device(dev)
     dev = None
+
+    # 等待 U-Boot 启动并重新枚举
+    time.sleep(3)
 
     # 重新查找 U-Boot 设备
     log("\n搜索 U-Boot USB 接口...")
@@ -636,13 +757,17 @@ def main():
             header("完成 — U-Boot 已加载 (不烧录)")
             sys.exit(0)
         log("\n错误: U-Boot 启动后设备未出现!")
+        log("可能原因:")
+        log("  1. UBOOT.USB (TPL) 不匹配此设备")
+        log("  2. U-Boot 不支持 USB 烧录模式 (需要 Amlogic vendor U-Boot)")
+        log("  3. 供电不足")
         sys.exit(1)
 
     log("U-Boot 设备已连接")
     wait_for_uboot(dev, timeout=15)
 
     # ============================================================
-    #  阶段 3: 烧录 (可选)
+    #  阶段 C: 烧录 (可选)
     # ============================================================
     if args.no_flash:
         header("完成 — U-Boot 已加载到内存 (--no-flash)")
@@ -651,13 +776,17 @@ def main():
         release_device(dev)
         sys.exit(0)
 
-    header("阶段 3: U-Boot 烧录 — 写入 eMMC")
+    header("阶段 C: U-Boot 烧录 — 写入 eMMC")
 
     # 初始化存储
     log("初始化 eMMC 存储...")
     resp = send_bulk_cmd(dev, "store init 1")
     if resp:
         log(f"  响应: {resp.strip()[:120]}")
+    else:
+        log("  (无响应, 可能 U-Boot 不支持 store 命令)")
+        log("  如果 U-Boot 是 mainline 版本, 不支持 Amlogic store 命令")
+        log("  需要使用 Amlogic vendor U-Boot 或改用 UMS 模式")
     time.sleep(2)
 
     # 烧录各分区
@@ -681,6 +810,8 @@ def main():
 
     if fail_count == 0:
         log("\n全部分区烧录成功!")
+        log("保存设置...")
+        send_bulk_cmd(dev, "save_setting")
         log("重启设备...")
         send_bulk_cmd(dev, "reset", read_response=False)
         time.sleep(1)
