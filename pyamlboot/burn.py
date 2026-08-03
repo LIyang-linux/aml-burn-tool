@@ -46,6 +46,7 @@ Amlogic USB Boot & Flash Tool — 基于 pyamlboot 协议库
 import sys
 import os
 import time
+import gzip
 import argparse
 
 # ---- 确保能导入同目录的 pyamlboot 包 ----
@@ -93,10 +94,11 @@ DEVICE_WAIT_MAX  = 30       # 等待设备重新枚举最大秒数
 BULK_TIMEOUT     = 30000    # 30s 批量传输
 
 # 烧录分区定义
+# files: 按优先级尝试的文件名列表 (支持 .gz 自动解压)
 PARTITIONS = [
     {
         "name":   "bootloader",
-        "file":   "bootloader.PARTITION",
+        "files":  ["bootloader.PARTITION"],
         "cmd_erase":  "store erase bootloader",
         "cmd_write":  "download store bootloader normal {size}",
         "desc":   "U-Boot 引导 (写入 eMMC boot0/boot1)",
@@ -104,7 +106,7 @@ PARTITIONS = [
     },
     {
         "name":   "boot",
-        "file":   "boot.PARTITION",
+        "files":  ["boot.PARTITION", "boot.fat32", "boot.fat32.gz", "boot.img", "boot.img.gz"],
         "cmd_erase":  "store erase boot",
         "cmd_write":  "download store boot normal {size}",
         "desc":   "内核 + DTB + initramfs",
@@ -112,7 +114,7 @@ PARTITIONS = [
     },
     {
         "name":   "system",
-        "file":   "system.PARTITION",
+        "files":  ["system.PARTITION", "rootfs.ext4", "rootfs.ext4.gz", "system.img", "system.img.gz"],
         "cmd_erase":  "store erase data",
         "cmd_write":  "download store system normal {size}",
         "desc":   "根文件系统",
@@ -491,23 +493,58 @@ def send_bulk_data(dev, data, chunk_size=512*1024):
     log(f"\n  传输完成: {fmt_size(total)} / {elapsed:.1f}s / {total/1024/elapsed:.0f}KB/s")
     return True
 
+def find_partition_file(part, base_dir):
+    """在 base_dir 中查找分区文件, 返回 (路径, 是否gzip) 或 None"""
+    for fname in part["files"]:
+        path = os.path.join(base_dir, fname)
+        if os.path.isfile(path):
+            is_gz = fname.endswith(".gz")
+            return (path, is_gz, fname)
+    return None
+
+def load_partition_data(part, base_dir):
+    """查找并加载分区数据, 自动解压 .gz"""
+    result = find_partition_file(part, base_dir)
+    if result is None:
+        return None, None, None
+
+    path, is_gz, fname = result
+    if is_gz:
+        log(f"  解压: {fname} ...")
+        with gzip.open(path, "rb") as f:
+            data = f.read()
+        log(f"  解压完成: {fmt_size(len(data))} (原压缩: {fmt_size(os.path.getsize(path))})")
+    else:
+        data = open(path, "rb").read()
+
+    return data, fname, len(data)
+
 def flash_partition(dev, part, base_dir):
     """擦除并写入单个分区"""
     name = part["name"]
-    file_path = os.path.join(base_dir, part["file"])
 
     log(f"\n--- 烧录分区: {name} ({part['desc']}) ---")
 
-    if not os.path.isfile(file_path):
+    result = find_partition_file(part, base_dir)
+    if result is None:
         if part.get("optional"):
-            log(f"  跳过: 文件不存在 ({part['file']})")
+            log(f"  跳过: 文件不存在 (尝试过: {', '.join(part['files'])})")
             return True
-        log(f"  错误: 文件不存在: {file_path}")
+        log(f"  错误: 文件不存在, 尝试过: {', '.join(part['files'])}")
         return False
 
-    data = open(file_path, "rb").read()
+    path, is_gz, fname = result
+
+    if is_gz:
+        log(f"  解压: {fname} ...")
+        with gzip.open(path, "rb") as f:
+            data = f.read()
+        log(f"  解压完成: {fmt_size(len(data))} (原压缩: {fmt_size(os.path.getsize(path))})")
+    else:
+        data = open(path, "rb").read()
+
     size = len(data)
-    log(f"  文件: {part['file']} ({fmt_size(size)})")
+    log(f"  文件: {fname} ({fmt_size(size)})")
 
     # 1. 擦除分区
     log(f"  擦除 {name} ...")
@@ -555,33 +592,49 @@ def flash_partition(dev, part, base_dir):
 def check_files(base_dir, params_dir, dry_run=False):
     """检查所需文件是否齐全"""
     log("检查烧录文件...")
-    required = [
-        ("DDR.USB", "BL2 引导镜像", base_dir, True),
-        ("UBOOT.USB", "TPL/U-Boot 镜像", base_dir, True),
-        (DDR_INIT_FILE, "DDR 初始化参数", params_dir, True),
-        (FIP_RUN_FILE, "FIP 加载参数", params_dir, True),
+
+    # 固定文件名 (非分区)
+    fixed_files = [
+        ("DDR.USB", "BL2 引导镜像", base_dir),
+        ("UBOOT.USB", "TPL/U-Boot 镜像", base_dir),
+        (DDR_INIT_FILE, "DDR 初始化参数", params_dir),
+        (FIP_RUN_FILE, "FIP 加载参数", params_dir),
     ]
-    for part in PARTITIONS:
-        if not part.get("optional"):
-            required.append((part["file"], part["desc"], base_dir, True))
 
     all_found = True
-    for fname, desc, search_dir, required_flag in required:
+
+    for fname, desc, search_dir in fixed_files:
         path = os.path.join(search_dir, fname)
         if os.path.isfile(path):
             size = os.path.getsize(path)
             log(f"  [OK] {fname:35s} {fmt_size(size):>10s}  {desc}")
         else:
-            tag = "缺失" if required_flag else "可选"
-            log(f"  [{tag}] {fname:35s}              {desc}")
-            if required_flag:
+            log(f"  [缺失] {fname:35s}              {desc}")
+            all_found = False
+
+    # 分区文件 (支持多文件名 + .gz)
+    for part in PARTITIONS:
+        result = find_partition_file(part, base_dir)
+        if result is not None:
+            path, is_gz, fname = result
+            size = os.path.getsize(path)
+            gz_tag = " (gz)" if is_gz else ""
+            log(f"  [OK] {fname:35s} {fmt_size(size):>10s}  {part['desc']}{gz_tag}")
+        else:
+            if part.get("optional"):
+                log(f"  [可选] {part['files'][0]:35s}              {part['desc']}")
+            else:
+                tried = " / ".join(part["files"])
+                log(f"  [缺失] {tried:35s}              {part['desc']}")
                 all_found = False
 
     if not all_found:
         log("\n错误: 必需文件缺失!")
         log(f"  参数文件 ({DDR_INIT_FILE}, {FIP_RUN_FILE}) 应在:")
         log(f"    {params_dir}")
-        log(f"  或从 linux/tools/datas/ 目录复制")
+        log(f"  DDR.USB / UBOOT.USB 从 B860AV2.1-A Releases 下载")
+        log(f"  分区文件支持: boot.PARTITION / boot.fat32 / boot.fat32.gz")
+        log(f"                system.PARTITION / rootfs.ext4 / rootfs.ext4.gz")
         return False
 
     log("文件检查通过")
