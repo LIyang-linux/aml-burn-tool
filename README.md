@@ -20,6 +20,12 @@
 
 ```
 aml-burn-tool/
+├── pyamlboot/                  # pyamlboot 协议库 (推荐方案)
+│   ├── pyamlboot.py            # Amlogic USB Boot 协议核心库
+│   ├── burn.py                 # 两阶段加载烧录脚本
+│   ├── setup.py                # pip 安装支持
+│   ├── requirements.txt        # Python 依赖
+│   └── __init__.py             # 包初始化
 ├── windows/                    # Windows 魔改工具包
 │   ├── launcher.bat            # 一键启动器 (自动补丁 + 启动)
 │   ├── patch_dll.py            # DLL 超时补丁器
@@ -48,6 +54,22 @@ aml-burn-tool/
 
 ## 快速开始
 
+### pyamlboot (推荐 — 纯 Python, 无需官方工具)
+
+```sh
+pip install pyusb
+cd pyamlboot/
+sudo python burn.py /path/to/files              # 完整烧录
+sudo python burn.py /path/to/files --no-flash   # 只加载 U-Boot, 不烧录
+sudo python burn.py /path/to/files --dry-run    # 只检查文件
+sudo python burn.py /path/to/files --skip-bl    # 跳过 bootloader 分区
+```
+
+**两阶段加载流程:**
+1. 阶段 1 (ROM): 上传 DDR.USB (BL2) → 初始化 DDR → 设备重新枚举
+2. 阶段 2 (BL2): 上传 UBOOT.USB (U-Boot) → 运行 U-Boot
+3. 阶段 3 (U-Boot): 通过 USB bulk 命令擦除 + 写入 eMMC 分区
+
 ### Windows
 
 1. 安装 [Amlogic USB Burning Tool](https://firmware.jethome.com/jethome/firmware/tool/AML_Burn_Tool_V2.1.6.8.zip) v2.1.6+
@@ -66,10 +88,13 @@ sudo ./install.sh          # 安装依赖
 sudo ./flash.sh /path/to/files   # 刷机
 ```
 
-### Python 替代方案 (无需官方工具)
+### Python 替代方案
 
 ```sh
 pip install pyusb
+# 方案 A: pyamlboot (推荐, 见上方说明)
+cd pyamlboot/ && python burn.py /path/to/files
+# 方案 B: 旧版脚本
 cd windows/  # 或 python/
 python win_flash.py /path/to/files
 ```

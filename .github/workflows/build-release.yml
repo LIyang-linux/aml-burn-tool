@@ -10,6 +10,7 @@ on:
       - 'windows/**'
       - 'linux/**'
       - 'python/**'
+      - 'pyamlboot/**'
       - 'README.md'
       - '.github/workflows/build-release.yml'
   workflow_dispatch:
@@ -38,6 +39,7 @@ jobs:
           cp -r windows release/aml-burn-tool/
           cp -r linux release/aml-burn-tool/
           cp -r python release/aml-burn-tool/
+          cp -r pyamlboot release/aml-burn-tool/
           cp README.md release/aml-burn-tool/ 2>/dev/null || true
 
           # 生成使用说明
@@ -59,9 +61,10 @@ jobs:
           3. sudo ./flash.sh /path/to/files
 
           【Python 替代方案】 (无需 USB Burning Tool)
-          1. pip install pyusb libusb0
-          2. cd windows/ (或 python/)
-          3. python win_flash.py /path/to/files
+          1. pip install pyusb
+          2. cd pyamlboot/
+          3. python burn.py /path/to/files           # 完整烧录
+          4. python burn.py /path/to/files --no-flash # 只加载 U-Boot
 
           ============================================================
           EOF
@@ -93,9 +96,15 @@ jobs:
           **国产 eMMC 兼容版 — 跳过 ERASE BOOTLOADER 超时**
 
           ### 包含内容
+          - **pyamlboot/**: pyamlboot 协议库 + 两阶段加载烧录脚本 (推荐方案)
           - **windows/**: 魔改启动器 + DLL超时补丁 + 注册表补丁 + 配置补丁
           - **linux/**: Linux USB 烧录工具 (update + aml_image_v2_packer)
           - **python/**: Python 纯烧录方案 (无需官方工具)
+
+          ### 推荐使用 (pyamlboot)
+          1. pip install pyusb
+          2. cd pyamlboot/
+          3. python burn.py /path/to/files
 
           ### Windows 使用
           1. 安装 Amlogic USB Burning Tool v2.1.6+
